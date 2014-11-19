@@ -1,8 +1,8 @@
-CC=ccache g++
+CC=g++
 
 DCFLAGS=-pipe -Wall -std=c++11 -O0 -g
-OCFLAGS=-pipe -Wall -std=c++11 -O3 -g
-CFLAGS=$(DCFLAGS)
+OCFLAGS=-pipe -Wall -std=c++11 -O3 -g -flto
+CFLAGS=$(OCFLAGS)
 LFLAGS=
 LIBS=-lgsl -lgslcblas
 

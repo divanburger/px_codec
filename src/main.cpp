@@ -1,15 +1,32 @@
 #include <iostream>
 #include <cmath>
+#include <random>
 #include <gsl/gsl_vector.h>
 #include <gsl/gsl_matrix.h>
 #include <gsl/gsl_fit.h>
 #include <gsl/gsl_multifit.h>
 
 #include "lodepng.h"
-#include "bitarray.h"
-#include "compression.h"
 
-using namespace std;
+#include "bitio/bitarray.h"
+#include "bitio/bitfile.h"
+#include "bitio/bitview.h"
+#include "bitio/bitdebug.h"
+
+#include "compression/bitmanip.h"
+#include "compression/compression.h"
+#include "compression/huffman.h"
+#include "compression/runlength.h"
+#include "compression/arithmetic_coder.h"
+#include "compression/rice.h"
+#include "compression/elias_gamma.h"
+
+#include "util.h"
+
+using std::min;
+using std::max;
+using std::cout;
+using std::endl;
 
 //#ifdef M_PI
 //#define PI M_PI
@@ -24,80 +41,60 @@ using namespace std;
 
 struct block_t
 {
+   double contrast[BLOCK_SIZE2];
    double luma[BLOCK_SIZE2];
    double chroma_a[BLOCK_SIZE2];
    double chroma_b[BLOCK_SIZE2];
 
+   double luma_x;
+   double luma_x2;
+
    double luma_res[BLOCK_SIZE2];
 
    uint8_t luma_pred_mode;
-   uint8_t luma_dc[5]; // 8-bit
+   uint8_t luma_dc[16];
 
-   uint8_t luma_diff_scale;  // 8-bit
-   uint8_t luma_diff_offset; // 8-bit
-   uint8_t bit_allocation; // 3-bit
+   uint8_t luma_diff_scale; 
+   uint8_t luma_diff_offset; 
+   uint8_t bit_allocation;
 
-   uint8_t luma_diff[BLOCK_SIZE2]; // 2-8 bit each
+   uint8_t luma_diff[BLOCK_SIZE2]; 
    uint8_t luma_comp[BLOCK_SIZE2];
-   uint8_t luma_bits[BLOCK_SIZE2*2]; // variable length
+   uint8_t luma_bits[BLOCK_SIZE2*2];
 
-   uint16_t chroma_a_c0; // 10-bit
-   uint16_t chroma_a_c1; // 10-bit
-   uint16_t chroma_b_c0; // 10-bit
-   uint16_t chroma_b_c1; // 10-bit
+   uint8_t luma_compress_mode;
+   uint8_t luma_length;
 
-   int   luma_bits_used;
-   int   chroma_bits_used;
+   uint8_t chroma_a_c0[2];
+   uint8_t chroma_a_c1[2];
+   uint8_t chroma_b_c0[2];
+   uint8_t chroma_b_c1[2];
 };
 
 struct image_t {
    unsigned width, height, size;
+   double*  pixels;
+   double*  contrast;
+
+   unsigned blocks_width, blocks_height, blocks_size;
    block_t* blocks;
 
-   huffman_tree_t* luma_1bit_huffman;
-   huffman_tree_t* luma_2bit_huffman;
-   huffman_tree_t* luma_3bit_huffman;
-   huffman_tree_t* luma_4bit_huffman;
+   canonical_huffman_t* luma_mode_coder;
+   canonical_huffman_t* luma_1bit_coder;
+   canonical_huffman_t* luma_2bit_coder;
+   canonical_huffman_t* luma_3bit_coder;
+   canonical_huffman_t* luma_4bit_coder;
+   canonical_huffman_t* luma_5bit_coder;
+   canonical_huffman_t* luma_6bit_coder;
 };
 
-float random(int x, int seed)
-{
-   int n = x * 1619 + seed * 6971;
-   n = (n>>8)^n;
-   return ((n * (n * n * 60493 + 19990303) + 1376312589) & 0x7fffffff) / 2147483647.0f;
-}
+gsl_vector* luma_vec = gsl_vector_calloc(BLOCK_SIZE2);
+gsl_vector* luma_weight_vec = gsl_vector_calloc(BLOCK_SIZE2);
 
-float random(int x, int y, int seed)
-{
-   int n = x * 1619 + y * 31337 + seed * 6971;
-   n = (n>>8)^n;
-   return ((n * (n * n * 60493 + 19990303) + 1376312589) & 0x7fffffff) / 2147483647.0f;
-}
-
-uint8_t toInt(double v)
-{
-   return (uint8_t)max(min((int)round(v * 255.0), 255), 0);
-}
-
-uint16_t toInt10(double v)
-{
-   return (uint16_t)max(min((int)round(v * 1023.0), 1023), 0);
-}
-
-double fromInt(uint8_t i)
-{
-   return i / 255.0;
-} 
-
-double fromInt10(uint16_t i)
-{
-   return min((int)i, 1023) / 1023.0;
-}
-
-double fromInt12(uint16_t i)
-{
-   return min((int)i, 4095) / 4095.0;
-}
+gsl_multifit_linear_workspace* fitting_workspace3 = gsl_multifit_linear_alloc(BLOCK_SIZE2, 3);
+gsl_matrix* pos_matrix3 = gsl_matrix_calloc(BLOCK_SIZE2, 3);
+gsl_vector *c3 = gsl_vector_calloc(3);
+gsl_matrix *cov3 = gsl_matrix_calloc(3, 3);
 
 void predict_luma(int mode, block_t& upleft_block, block_t& left_block, block_t& up_block, double* out_luma)
 {
@@ -137,6 +134,16 @@ void predict_luma(int mode, block_t& upleft_block, block_t& left_block, block_t&
                out_luma[i] = (left * (x+1.0) + up * (y+1.0)) / (x+y+2.0);
             }
          break;
+      case 6:
+         for (int y = 0; y < BLOCK_SIZE; y++)
+            for (int x = 0; x < BLOCK_SIZE; x++)
+            {
+               int i = x+y*BLOCK_SIZE;
+               double up = up_block.luma_res[i];
+               double left = left_block.luma_res[i];
+               out_luma[i] = up + left - up * left;
+            }
+         break;
       default:
          for (int y = 0; y < BLOCK_SIZE; y++)
             for (int x = 0; x < BLOCK_SIZE; x++)
@@ -144,363 +151,598 @@ void predict_luma(int mode, block_t& upleft_block, block_t& left_block, block_t&
    }
 }
 
-void decode_dc_luma(int type, double* params, double* out_luma)
+void decode_dc_luma(int mode, double* params, double* out_luma)
 {
-   if (type == 0)
+   if (mode == 0)
    {
       for (unsigned i = 0; i < BLOCK_SIZE2; i++)
          out_luma[i] = params[0];
    }
-   else
+   else if (mode == 7)
    {
+      for (unsigned y = 0; y < BLOCK_SIZE; y++)
+         for (unsigned x = 0; x < BLOCK_SIZE; x++)
+         {
+            int ix = BLOCK_SIZE - 1 - x;
+            int iy = BLOCK_SIZE - 1 - y;
+
+            double v = params[0] * ix * iy + params[1] * x * iy + params[2] * ix * y + params[3] * x * y;
+            out_luma[x+y*BLOCK_SIZE] = v / ((BLOCK_SIZE-1) * (BLOCK_SIZE-1));
+         }
+   }
+   else if (mode == 1)
+   {
+      const float factor = 2.0 / BLOCK_SIZE;
       for (unsigned y = 0; y < BLOCK_SIZE; y++)
          for (unsigned x = 0; x < BLOCK_SIZE; x++)
          {
             unsigned index = x+y*BLOCK_SIZE;
             double luma_p = params[0];
-            luma_p += params[1] * x;
-            luma_p += params[2] * y;
+            luma_p += params[1] * x * factor;
+            luma_p += params[2] * y * factor;
             out_luma[index] = luma_p;
          }
    }
+   else
+   {
+      for (unsigned i = 0; i < BLOCK_SIZE2; i++)
+         out_luma[i] = params[0];
+   }
 }
 
-void encode_decode(unsigned width, unsigned height, uint8_t* data)
+void write_variable_length_number(uint32_t value, bit_writer_t& writer)
 {
-   unsigned size = width * height;
-   double*  pixels = new double[size*4];
-
-   unsigned blocks_width = width / BLOCK_SIZE;
-   unsigned blocks_height = height / BLOCK_SIZE;
-   unsigned blocks_size = blocks_width * blocks_height;
-
-   image_t image;
-   image.width = width;
-   image.height = height;
-   image.blocks = new block_t[blocks_size];
-
-   const double THRESHOLD = 0.04045;
-   const double THRESHOLD2 = 0.0031308;
-   const double OFFSET = 0.055;
-   const double FACTOR1 = 1.055;
-   const double FACTOR2 = 12.92;
-   const double GAMMA = 2.4;
-   const double INV_GAMMA = 1.0 / 2.4;
-
-   for (unsigned i = 0; i < size; i++)
+   do
    {
-      double x, y, z, alpha;
-
-      {
-         double r = data[i*4+0] / 255.0;
-         double g = data[i*4+1] / 255.0;
-         double b = data[i*4+2] / 255.0;
-         double a = data[i*4+3] / 255.0;
-
-         // Convert to linear RGB
-         r = (r > THRESHOLD) ? pow((r + OFFSET) / FACTOR1, GAMMA) : r / FACTOR2;
-         g = (g > THRESHOLD) ? pow((g + OFFSET) / FACTOR1, GAMMA) : g / FACTOR2;
-         b = (b > THRESHOLD) ? pow((b + OFFSET) / FACTOR1, GAMMA) : b / FACTOR2;
-
-         // Convert to XYZ
-         x = r * 0.4124 + g * 0.3576 + b * 0.1805;
-         y = r * 0.2126 + g * 0.7152 + b * 0.0722;
-         z = r * 0.0193 + g * 0.1192 + b * 0.9505;
-         alpha = a;
-      }
-
-      double xr = x / 0.95047;
-      double yr = y / 1.00000;
-      double zr = z / 1.08883;
-
-      xr = xr > 0.008856 ? pow(xr, 1.0 / 3.0) : 7.787 * xr + 16.0 / 116.0;
-      yr = yr > 0.008856 ? pow(yr, 1.0 / 3.0) : 7.787 * yr + 16.0 / 116.0;
-      zr = zr > 0.008856 ? pow(zr, 1.0 / 3.0) : 7.787 * zr + 16.0 / 116.0;
-
-      double L = 1.16 * yr - 0.16;
-      double a = 5.00 * (xr - yr);
-      double b = 2.00 * (yr - zr);
-
-      pixels[i*4+0] = L;
-      pixels[i*4+1] = a;
-      pixels[i*4+2] = b;
-      pixels[i*4+3] = alpha;
+      writer.write_byte((value > 127 ? 0x80 : 0) + (value & 0x7F));
+      value >>= 7;
    }
+   while (value != 0);
+}
 
-
-
-   //////////////////////////////////////////////////////////////////////////////////////////////////////////////////
-   // ENCODE //
-   ////////////
-   int luma_bits_used = 0, chroma_bits_used = 0;
+uint32_t read_variable_length_number(bit_reader_t& reader)
+{
+   unsigned b = 0x80;
+   unsigned shift = 0;
+   uint32_t value = 0;
+   while ((b & 0x80) == 0x80)
    {
-      // Split into blocks
-      for (unsigned my = 0; my < blocks_height; my++)
-         for (unsigned mx = 0; mx < blocks_width; mx++)
+      b = reader.read_byte();
+      value += (b & 0x7F) << shift;
+      shift += 7;
+   }
+   return value;
+}
+
+double calculate_score(unsigned bit_cost, double mse, unsigned quality)
+{
+   double q = sqr(clamp(quality / 7.0, 0.0, 1.0));
+   double score = mse * (1.0 - q) * 100.0 + bit_cost * q * 0.001;
+   return score;
+}
+
+void guassian_blur_filter(double* input, int width, int height, unsigned input_stride, double* output, unsigned output_stride)
+{
+   double* buffer = new double[width * height];
+
+   const double guassian_filter[7] = {1.0, 6.0, 15.0, 20.0, 15.0, 6.0, 1.0};
+   for (unsigned y = 0; y < height; y++)
+      for (unsigned x = 0; x < width; x++)
+      {
+         double t = 0.0;
+         for (int fy = -3; fy <= 3; fy++) 
          {
-            block_t& block = image.blocks[mx+my*blocks_width];
-            for (unsigned by = 0; by < BLOCK_SIZE; by++)
-               for (unsigned bx = 0; bx < BLOCK_SIZE; bx++)
-               {
-                  unsigned x = mx*BLOCK_SIZE + bx, y = my*BLOCK_SIZE + by;
-                  unsigned index = x+y*width;
-                  unsigned block_index = bx+by*BLOCK_SIZE;
-                  block.luma[block_index] = pixels[index*4+0];
-                  block.chroma_a[block_index] = pixels[index*4+1];
-                  block.chroma_b[block_index] = pixels[index*4+2];
-               }
+            int sy = clamp(y + fy, 0, height - 1);
+            t += input[(x + sy * width) * input_stride] * guassian_filter[fy + 3];
          }
 
-      gsl_vector* luma_vec = gsl_vector_calloc(BLOCK_SIZE2);
-      gsl_vector* luma_weight_vec = gsl_vector_calloc(BLOCK_SIZE2);
+         buffer[x + y * width] = t;
+      }
 
-      gsl_multifit_linear_workspace* fitting_workspace3 = gsl_multifit_linear_alloc(BLOCK_SIZE2, 3);
-      gsl_matrix* pos_matrix3 = gsl_matrix_calloc(BLOCK_SIZE2, 3);
-      gsl_vector *c3 = gsl_vector_calloc(3);
-      gsl_matrix *cov3 = gsl_matrix_calloc(3, 3);
+   for (unsigned y = 0; y < height; y++)
+      for (unsigned x = 0; x < width; x++)
+      {
+         double t = 0.0;
+         for (int fx = -3; fx <= 3; fx++) 
+         {
+            int sx = clamp(x + fx, 0, width - 1);
+            t += buffer[sx + y * width] * guassian_filter[fx + 3];
+         }
 
+         output[(x + y * width) * output_stride] = t / (64.0 * 64.0);
+      }
+
+   delete [] buffer;
+}
+
+void max_filter(double* input, int width, int height, unsigned input_stride, double* output, unsigned output_stride)
+{
+   double* buffer = new double[width * height];
+
+   for (unsigned y = 0; y < height; y++)
+      for (unsigned x = 0; x < width; x++)
+      {
+         double t = 0.0;
+         for (int fy = -1; fy <= 1; fy++) 
+         {
+            int sy = y + fy;
+            if (sy >= 0 && sy < height)
+               t = max(t, input[(x + sy * width) * input_stride]);
+         }
+
+         buffer[x + y * width] = t;
+      }
+
+   for (unsigned y = 0; y < height; y++)
+      for (unsigned x = 0; x < width; x++)
+      {
+         double t = 0.0;
+         for (int fx = -1; fx <= 1; fx++) 
+         {
+            int sx = x + fx;
+            if (sx >= 0 && sx < width)
+               t = max(t, buffer[sx + y * width]);
+         }
+         
+         output[(x + y * width) * output_stride] = t;
+      } 
+
+   delete [] buffer;
+}
+
+struct mode_stats_t
+{
+   bool     valid = false;
+   unsigned bits_used = 0;
+   double   luma_range = 0.0;
+   double   parameters[16];
+};
+
+struct residual_stats_t
+{
+   bool     valid = false;
+   unsigned bits_used = 0;
+   double   error = 1e9;
+   double   weighted_error = 1e9;
+};
+
+double* generate_mode_data(image_t& image, unsigned bx, unsigned by, mode_stats_t& stats, unsigned mode)
+{
+   block_t&       block = image.blocks[bx+by*image.blocks_width];
+
+   if ((bx == 0 || by == 0) && mode > 1 && mode < 7) return nullptr;
+
+   // Calculate mode predictions
+   double pred_luma[BLOCK_SIZE2] = {0.0};
+   
+   if (mode > 1 && mode < 7)
+   {
+      int upleft_index = bx-1+(by-1)*image.blocks_width;
+      int up_index = bx+(by-1)*image.blocks_width;
+      int left_index = bx-1+by*image.blocks_width;
+      assert (upleft_index >= 0 && up_index >= 0 && left_index >= 0);
+      predict_luma(mode, image.blocks[upleft_index], image.blocks[left_index], image.blocks[up_index], pred_luma);
+   }
+
+   if (mode == 0)
+   {
+      double total = 0.0;
+      for (unsigned i = 0; i < BLOCK_SIZE2; i++) total += block.luma[i];
+      stats.parameters[0] = total / BLOCK_SIZE2;
+      stats.bits_used = 8;
+   }
+   else if (mode == 7)
+   {
+      stats.parameters[0] = block.luma[0];
+      stats.parameters[1] = block.luma[BLOCK_SIZE-1];
+      stats.parameters[2] = block.luma[BLOCK_SIZE2-BLOCK_SIZE];
+      stats.parameters[3] = block.luma[BLOCK_SIZE2-1];
+      stats.bits_used = 4 * 6;
+   }
+   else if (mode == 1)
+   {
+      double factor = 2.0 / BLOCK_SIZE;
       for (unsigned y = 0; y < BLOCK_SIZE; y++)
          for (unsigned x = 0; x < BLOCK_SIZE; x++)
          {
-            double weight = (x < 2 || y < 2 || x >= BLOCK_SIZE-2 || y >= BLOCK_SIZE-2) ? 5.0 : 0.2;
-            gsl_vector_set(luma_weight_vec, x+y*BLOCK_SIZE, weight);
+            unsigned index = x+y*BLOCK_SIZE;
+            double luma = block.luma[index] - pred_luma[index];
+            gsl_matrix_set(pos_matrix3, index, 0, 1.0);
+            gsl_matrix_set(pos_matrix3, index, 1, x * factor - 1.0);
+            gsl_matrix_set(pos_matrix3, index, 2, y * factor - 1.0);
+            gsl_vector_set(luma_vec, index, luma);
          }
 
-      for (unsigned by = 0; by < blocks_height; by++)
-         for (unsigned bx = 0; bx < blocks_width; bx++)
+      double chisq;
+      gsl_multifit_wlinear(pos_matrix3, luma_weight_vec, luma_vec, c3, cov3, &chisq, fitting_workspace3);
+      for (int i = 0; i < 3; i++) stats.parameters[i] = gsl_vector_get(c3, i);
+      stats.bits_used = 3 * 8;
+   }
+   else
+   {
+      double factor = 2.0 / BLOCK_SIZE;
+      for (unsigned y = 0; y < BLOCK_SIZE; y++)
+         for (unsigned x = 0; x < BLOCK_SIZE; x++)
          {
-            block_t& block = image.blocks[bx+by*blocks_width];
+            unsigned index = x+y*BLOCK_SIZE;
+            double luma = block.luma[index] - pred_luma[index];
+            gsl_matrix_set(pos_matrix3, index, 0, 1.0);
+            gsl_matrix_set(pos_matrix3, index, 1, 0.0);
+            gsl_matrix_set(pos_matrix3, index, 2, 0.0);
+            gsl_vector_set(luma_vec, index, luma);
+         }
 
-            block.chroma_bits_used = 0;
-            block.luma_bits_used = 0;
+      double chisq;
+      gsl_multifit_wlinear(pos_matrix3, luma_weight_vec, luma_vec, c3, cov3, &chisq, fitting_workspace3);
+      for (int i = 0; i < 3; i++) stats.parameters[i] = gsl_vector_get(c3, i);
+      stats.bits_used = 1 * 8;
+   }
 
-            // Determine roughness
-            double vert_diffs = 0.0, hor_diffs = 0.0;
-            for (unsigned y = 1; y < BLOCK_SIZE; y++)
-               for (unsigned x = 1; x < BLOCK_SIZE; x++)
-               {
-                  unsigned index = x+y*BLOCK_SIZE;
-                  unsigned l_index = (x-1)+y*BLOCK_SIZE;
-                  unsigned u_index = x+(y-1)*BLOCK_SIZE;
-                  double luma = block.luma[index];
-                  double l_luma = block.luma[l_index];
-                  double u_luma = block.luma[u_index];
-                  hor_diffs += min(abs(luma - l_luma), 0.2);
-                  vert_diffs += min(abs(luma - u_luma), 0.2);
-               }
-            double roughness = max(vert_diffs, hor_diffs) / (BLOCK_SIZE-1)*(BLOCK_SIZE-1);
+   // Determine luma error and residual range
+   {
+      double luma_dc_fit[BLOCK_SIZE2] = {0.0};
+      decode_dc_luma(mode, stats.parameters, luma_dc_fit);
 
-            // Fit plane to luma
-            unsigned mode_bits_used[6];
-            unsigned mode_diff_bits_used[6] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
-            double   mode_luma_dc_chisq[6] = {1e9, 1e9, 1e9, 1e9, 1e9, 1e9};
-            double   mode_luma_dc[5*6];
-            for (unsigned mode = 0; mode < 6; mode++)
+      double max_luma = -1e6, min_luma = 0.0; // Min Luma starts with zero to force it to at least zero
+      for (unsigned y = 0; y < BLOCK_SIZE; y++)
+         for (unsigned x = 0; x < BLOCK_SIZE; x++)
+         {
+            unsigned index = x+y*BLOCK_SIZE;
+            double luma_diff = block.luma[index] - max(min(pred_luma[index] + luma_dc_fit[index], 1.0), 0.0);
+            if (max_luma < luma_diff) max_luma = luma_diff;
+            if (min_luma > luma_diff) min_luma = luma_diff;
+         }
+
+      unsigned q_offset = min(max((int)ceil(-min_luma * 255.0), 0), 255);
+      double   luma_offset = q_offset / 255.0;
+   }
+
+   // Quantize and decode again for reference
+   if (mode == 0)
+   {
+      block.luma_dc[0] = toInt(stats.parameters[0]);
+      stats.parameters[0] = fromInt(block.luma_dc[0]);
+   }
+   else if (mode == 7)
+   {
+      for (unsigned i = 0; i < 4; i++)
+         block.luma_dc[i] = toInt(stats.parameters[i]);
+
+      for (unsigned i = 0; i < 4; i++)
+         stats.parameters[i] = fromInt(block.luma_dc[i]);
+   }
+   else
+   {
+      for (unsigned i = 0; i < 3; i++)
+         block.luma_dc[i] = toInt(stats.parameters[i] * 0.5 + 0.5);
+
+      for (unsigned i = 0; i < 3; i++)
+         stats.parameters[i] = (fromInt(block.luma_dc[i]) - 0.5) * 2.0;
+   }
+
+   // Generate fit values
+   double* luma_dc_res = new double[BLOCK_SIZE2];
+   {
+      for (int i = 0; i < BLOCK_SIZE2; i++) luma_dc_res[i] = 0.0;
+
+      double luma_dc_pred[BLOCK_SIZE2] = {0.0};
+      double luma_dc_fit[BLOCK_SIZE2] = {0.0};
+      if (mode > 1 && mode < 7)
+         predict_luma(mode, image.blocks[(bx-1)+(by-1)*image.blocks_width], image.blocks[(bx-1)+by*image.blocks_width], image.blocks[bx+(by-1)*image.blocks_width], luma_dc_pred);
+
+      decode_dc_luma(mode, stats.parameters, luma_dc_fit);
+
+      for (unsigned i = 0; i < BLOCK_SIZE2; i++)
+         block.luma_res[i] = luma_dc_res[i] = max(min(luma_dc_pred[i] + luma_dc_fit[i], 1.0), 0.0);
+   }
+
+   // Calculate difference range
+   double max_luma = -1e6, min_luma = 0.0, sum_x = 0, sum_x2 = 0.0; // Min Luma starts with zero to force it to at least zero
+   for (unsigned y = 0; y < BLOCK_SIZE; y++)
+      for (unsigned x = 0; x < BLOCK_SIZE; x++)
+      {
+         unsigned index = x+y*BLOCK_SIZE;
+         double luma_diff = block.luma[index] - luma_dc_res[index];
+         sum_x += luma_diff;
+         sum_x2 += luma_diff * luma_diff;
+         if (max_luma < luma_diff) max_luma = luma_diff;
+         if (min_luma > luma_diff) min_luma = luma_diff;
+      }
+
+   // Calculate luma difference scale and offset
+   block.luma_diff_offset = min(max((int)ceil(-min_luma * 255.0), 0), 255);
+   double luma_offset = block.luma_diff_offset / 255.0;
+   block.luma_diff_scale = min(max((int)ceil((max_luma + luma_offset) * 127.0), 0), 255);
+   if (block.luma_diff_scale < 1) block.luma_diff_scale = 1;
+   double luma_scale = block.luma_diff_scale / 127.0;
+   stats.luma_range = luma_scale;
+
+   block.luma_pred_mode = mode;
+   stats.valid = true;
+
+   return luma_dc_res;
+}
+
+void generate_bit_allocation_data(image_t& image, unsigned bx, unsigned by, residual_stats_t& stats, double* residual, unsigned bit_allocation)
+{
+   block_t& block = image.blocks[bx+by*image.blocks_width];
+
+   double luma_offset = block.luma_diff_offset / 255.0;
+   double luma_scale = block.luma_diff_scale / 127.0;
+   if (bit_allocation == 0)
+   {
+      block.luma_diff_scale = 0;
+      luma_scale = 0.0;
+   }
+
+   double luma_scale_log = log2(block.luma_diff_scale);
+   const double inv_luma_scale = 127.0 / block.luma_diff_scale;
+
+   uint16_t factor = 0;
+   if (block.luma_diff_scale > 0)
+   {
+      int needed_bit_allocation = max((int)luma_scale_log, 1);
+      if (needed_bit_allocation < bit_allocation) return;
+      block.bit_allocation = clamp(bit_allocation, 1, 6);
+      factor = (1<<block.bit_allocation)-1;
+
+      // Calculate luma difference
+      for (unsigned y = 0; y < BLOCK_SIZE; y++)
+         for (unsigned x = 0; x < BLOCK_SIZE; x++)
+         {
+            unsigned index = x+y*BLOCK_SIZE;
+            double luma_base = residual[index] - luma_offset;
+
+            double diff = block.luma[index] - residual[index];
+
+            // Positioned dithering
+            double dither[16] = {1, 9, 3, 11, 13, 5, 15, 7, 4, 12, 2, 10, 16, 8, 14, 6};
+
+            double luma_diff = (block.luma[index] - luma_base) * inv_luma_scale;
+            int luma_q = clamp((int)floor(luma_diff * factor + dither[(x&3)+(y&3)*4] / 17.0), 0, factor);
+
+            block.luma_diff[index] = luma_q;
+
+            // Decode again for reference as well as for error calculation
+            double luma_decoded_diff = luma_q / (double)factor;
+            double luma_decoded = clamp(luma_decoded_diff * luma_scale + luma_base, 0.0, 1.0);
+            block.luma_res[index] = luma_decoded;
+         }
+   }
+   else
+      for (unsigned i = 0; i < BLOCK_SIZE2; i++)
+         block.luma_res[i] = residual[i];
+
+   // Calculate error
+   double sq_error = 0.0;
+   for (unsigned i = 0; i < BLOCK_SIZE2; i++)
+      sq_error += sqr(block.luma_res[i] - block.luma[i]);
+   stats.error = sq_error / BLOCK_SIZE2;
+
+   sq_error = 0.0;
+   for (unsigned i = 0; i < BLOCK_SIZE2; i++)
+      sq_error += sqr(block.luma_res[i] - block.luma[i]) * clamp(1.0 - block.contrast[i], 0.1, 1.0);
+   stats.weighted_error = sq_error / BLOCK_SIZE2;
+
+   stats.valid = true;
+   stats.bits_used = bit_allocation;
+}
+
+//////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+// ENCODE //
+////////////
+void encode(string output_filename, uint8_t* data, unsigned width, unsigned height, unsigned quality = 2)
+{
+   image_t image;
+   image.width = width;
+   image.height = height;
+   image.pixels = new double[width*height*4];
+   image.contrast = new double[width*height];
+
+   unsigned size = width * height;
+
+   // Transform data to YUV colour space
+   for (unsigned i = 0; i < size; i++)
+   {
+      double r = data[i*4+0] / 255.0;
+      double g = data[i*4+1] / 255.0;
+      double b = data[i*4+2] / 255.0;
+      double a = data[i*4+3] / 255.0;
+
+      image.pixels[i*4+0] = r * 0.299 + g * 0.587 + b * 0.114;
+      image.pixels[i*4+1] = 0.5 - r * 0.168736 - g * 0.331264 + b * 0.5;
+      image.pixels[i*4+2] = 0.5 + r * 0.5 - g * 0.418688 - b * 0.081312;
+      image.pixels[i*4+3] = a;
+   }
+
+   // Calculate constrast
+   guassian_blur_filter(image.pixels, width, height, 4, image.contrast, 1);
+
+   for (unsigned i = 0; i < size; i++)
+      image.contrast[i] = fabs(image.contrast[i] - image.pixels[i*4]);
+
+   max_filter(image.contrast, width, height, 1, image.contrast, 1);
+
+   // for (unsigned i = 0; i < size; i++)
+   //    image.pixels[i*4] = min(image.contrast[i], 1.0);
+
+   // for (unsigned i = 0; i < size; i++)
+   //    image.contrast[i] = 0.0;
+
+   // Split into blocks
+   image.blocks_width = (width + BLOCK_SIZE - 1) / BLOCK_SIZE;
+   image.blocks_height = (height + BLOCK_SIZE - 1) / BLOCK_SIZE;
+   image.blocks_size = image.blocks_width * image.blocks_height;
+   image.blocks = new block_t[image.blocks_size];
+
+   for (unsigned my = 0; my < image.blocks_height; my++)
+      for (unsigned mx = 0; mx < image.blocks_width; mx++)
+      {
+         block_t& block = image.blocks[mx+my*image.blocks_width];
+
+         for (unsigned by = 0; by < BLOCK_SIZE; by++)
+            for (unsigned bx = 0; bx < BLOCK_SIZE; bx++)
             {
-               if ((bx == 0 || by == 0) && mode > 1) continue;
+               unsigned x = min(mx*BLOCK_SIZE + bx, width - 1), y = min(my*BLOCK_SIZE + by, height - 1);
+               unsigned index = x+y*width;
+               unsigned block_index = bx+by*BLOCK_SIZE;
+               block.contrast[block_index] = image.contrast[index];
+               block.luma[block_index] = image.pixels[index*4+0];
+               block.chroma_a[block_index] = image.pixels[index*4+1];
+               block.chroma_b[block_index] = image.pixels[index*4+2];
+            }
+      }
 
-               double pred_luma[BLOCK_SIZE2] = {0.0};
-               
-               if (mode > 1)
+   for (unsigned y = 0; y < BLOCK_SIZE; y++)
+      for (unsigned x = 0; x < BLOCK_SIZE; x++)
+      {
+         double weight = (x < 2 || y < 2 || x >= BLOCK_SIZE-2 || y >= BLOCK_SIZE-2) ? 5.0 : 0.2;
+         gsl_vector_set(luma_weight_vec, x+y*BLOCK_SIZE, weight);
+      }
+
+   // Heuristics for compression
+   const unsigned block_size_comp[7] = {
+      0,
+      BLOCK_SIZE2 / 2,
+      BLOCK_SIZE2 / 2 + BLOCK_SIZE2 / 8,
+      BLOCK_SIZE2 - BLOCK_SIZE2 / 4,
+      BLOCK_SIZE2 - BLOCK_SIZE2 / 8,
+      BLOCK_SIZE2 - BLOCK_SIZE2 / 8,
+      BLOCK_SIZE2 - BLOCK_SIZE2 / 16};
+
+   for (unsigned by = 0; by < image.blocks_height; by++)
+      for (unsigned bx = 0; bx < image.blocks_width; bx++)
+      {
+         unsigned lowest_mode = 0;
+         unsigned lowest_bit_alloc = 1;
+         double   lowest_score = 1e6;
+
+         for (unsigned mode = 0; mode < 8; mode++)
+         {
+            mode_stats_t mode_stats;
+            double* residual = generate_mode_data(image, bx, by, mode_stats, mode);
+            if (!mode_stats.valid || !residual) break;
+
+            for (unsigned bit_allocation = 0; bit_allocation <= 6; bit_allocation++)
+            {
+               if (bit_allocation == 0 && mode_stats.luma_range > 0.001 && (mode != 7 || mode_stats.luma_range > 0.003)) continue;
+
+               residual_stats_t residual_stats;
+               generate_bit_allocation_data(image, bx, by, residual_stats, residual, bit_allocation);
+               if (!residual_stats.valid) break;
+
+               unsigned cost  = residual_stats.bits_used * block_size_comp[bit_allocation] + mode_stats.bits_used;
+               double   weight = bit_allocation == 0 ? 0.0 : quality / 7.0;
+               double   error = residual_stats.weighted_error * weight + residual_stats.error * (1.0 - weight);
+               double   score = calculate_score(cost, error, quality);
+               if (score < lowest_score)
                {
-                  int upleft_index = bx-1+(by-1)*blocks_width;
-                  int up_index = bx+(by-1)*blocks_width;
-                  int left_index = bx-1+by*blocks_width;
-                  assert (upleft_index >= 0 && up_index >= 0 && left_index >= 0);
-                  predict_luma(mode, image.blocks[upleft_index], image.blocks[left_index], image.blocks[up_index], pred_luma);
+                  lowest_score = score;
+                  lowest_bit_alloc = bit_allocation;
+                  lowest_mode = mode;
+               }
+            }
+         }
+
+         printf("%i ", lowest_mode);
+
+         mode_stats_t mode_stats;
+         double* residual = generate_mode_data(image, bx, by, mode_stats, lowest_mode);
+         residual_stats_t residual_stats;
+         generate_bit_allocation_data(image, bx, by, residual_stats, residual, lowest_bit_alloc);
+
+         block_t& block = image.blocks[bx+by*image.blocks_width];
+
+         // Determine chroma centers
+         double chroma_center_a[2] = {0.25, 0.75}, chroma_center_b[2] = {0.75, 0.25};
+         {
+            double total_a[2], total_b[2];
+            unsigned total_c[2];
+            bool chroma_center_reset = false;
+
+            printf("%i %i -- ", bx, by);
+            for (int i = 0; i < 100; i++)
+            {
+               total_a[0] = 0.0;
+               total_a[1] = 0.0;
+               total_b[0] = 0.0;
+               total_b[1] = 0.0;
+               total_c[0] = 0;
+               total_c[1] = 0;
+
+               for (unsigned j = 0; j < BLOCK_SIZE2; j++)
+               {
+                  double dist[2] = {0};
+                  double chroma_a = block.chroma_a[j];
+                  double chroma_b = block.chroma_b[j];
+
+                  for (int k = 0; k < 2; k++)
+                     dist[k] = sqr(chroma_center_a[k] - chroma_a) + sqr(chroma_center_b[k] - chroma_b);
+
+                  if (dist[0] > dist[1])
+                  {
+                     total_a[1] += chroma_a;
+                     total_b[1] += chroma_b;
+                     total_c[1]++;
+                  }
+                  else
+                  {
+                     total_a[0] += chroma_a;
+                     total_b[0] += chroma_b;
+                     total_c[0]++;
+                  }
                }
 
-               if (mode == 0)
+               if ((total_c[0] == 0 || total_c[1] == 0) && !chroma_center_reset)
                {
-                  double total = 0.0;
-                  for (unsigned i = 0; i < BLOCK_SIZE2; i++) total += block.luma[i];
-                  mode_luma_dc[mode*5] = total / BLOCK_SIZE2;
-                  mode_bits_used[mode] = 8;
+                  chroma_center_reset = true;
+
+                  chroma_center_a[0] = block.chroma_a[0];
+                  chroma_center_b[0] = block.chroma_b[0];
+
+                  chroma_center_a[1] = block.chroma_a[BLOCK_SIZE2-1];
+                  chroma_center_b[1] = block.chroma_b[BLOCK_SIZE2-1];
                }
                else
                {
-                  for (unsigned y = 0; y < BLOCK_SIZE; y++)
-                     for (unsigned x = 0; x < BLOCK_SIZE; x++)
-                     {
-                        unsigned index = x+y*BLOCK_SIZE;
-                        double luma = block.luma[index] - pred_luma[index];
-                        gsl_matrix_set(pos_matrix3, index, 0, 1.0);
-                        gsl_matrix_set(pos_matrix3, index, 1, x);
-                        gsl_matrix_set(pos_matrix3, index, 2, y);
-                        gsl_vector_set(luma_vec, index, luma);
-                     }
-
-                  gsl_multifit_wlinear(pos_matrix3, luma_weight_vec, luma_vec, c3, cov3, &mode_luma_dc_chisq[mode], fitting_workspace3);
-                  for (int i = 0; i < 3; i++) mode_luma_dc[i + mode*5] = gsl_vector_get(c3, i);
-                  mode_bits_used[mode] = 3 * 8;
-               }
-
-               // Determine luma residual range
-               {
-                  double luma_dc_fit[BLOCK_SIZE2] = {0.0};
-                  decode_dc_luma(mode == 0 ? 0 : 1, &mode_luma_dc[mode*5], luma_dc_fit);
-
-                  double max_luma = -1e6, min_luma = 0; // Min Luma starts with zero to force it to at least zero
-                  for (unsigned y = 0; y < BLOCK_SIZE; y++)
-                     for (unsigned x = 0; x < BLOCK_SIZE; x++)
-                     {
-                        unsigned index = x+y*BLOCK_SIZE;
-                        double luma_diff = block.luma[index] - max(min(pred_luma[index] + luma_dc_fit[index], 1.0), 0.0);
-                        if (max_luma < luma_diff) max_luma = luma_diff;
-                        if (min_luma > luma_diff) min_luma = luma_diff;
-                     }
-
-                  unsigned q_offset = min(max((int)ceil(-min_luma * 255.0), 0), 255);
-                  double   luma_offset = q_offset / 255.0;
-                  unsigned q_scale = min(max((int)ceil((max_luma + luma_offset) * 127.0), 0), 255);
-
-                  unsigned luma_bits = 1;
-                  while ((1 << luma_bits) < q_scale) luma_bits++;
-                  mode_diff_bits_used[mode] = luma_bits;
-               }
-            }
-            
-            double luma_dc[5] = {0};
-            unsigned luma_dc_score = mode_diff_bits_used[0] * BLOCK_SIZE2 / 2 + mode_bits_used[0];
-            for (unsigned i = 0; i < 5; i++) luma_dc[i] = mode_luma_dc[i];
-
-            block.luma_pred_mode = 0;
-            for (unsigned i = 1; i < 6; i++)
-            {
-               if (mode_diff_bits_used[i] >= 0xFF) continue;
-
-               unsigned score = mode_diff_bits_used[i] * BLOCK_SIZE2 / 2 + mode_bits_used[i];
-               if (luma_dc_score > score)
-               {
-                  luma_dc_score = score;
-                  for (unsigned j = 0; j < 5; j++) luma_dc[j] = mode_luma_dc[j + i*5];
-                  block.luma_pred_mode = i;
-               }
-            }
-
-            //cout << (int)block.luma_pred_mode << endl;
-            block.luma_bits_used += 2 + mode_bits_used[block.luma_pred_mode];
-
-            // Quantize and decode again for reference
-            block.luma_dc[0] = toInt(luma_dc[0] * 0.5 + 0.5);
-            for (unsigned i = 1; i < 3; i++)
-               block.luma_dc[i] = toInt(luma_dc[i] * BLOCK_SIZE + 0.5);
-
-            luma_dc[0] = (fromInt(block.luma_dc[0]) - 0.5) * 2.0;
-            for (unsigned i = 1; i < 3; i++)
-               luma_dc[i] = (fromInt(block.luma_dc[i]) - 0.5) / BLOCK_SIZE;
-         
-            block.luma_bits_used += 3 * 8;
-
-            // Generate fit values
-            double luma_dc_res[BLOCK_SIZE2] = {0.0};
-            {
-               unsigned pred_type = block.luma_pred_mode;
-
-               double luma_dc_pred[BLOCK_SIZE2] = {0.0};
-               double luma_dc_fit[BLOCK_SIZE2] = {0.0};
-               if (pred_type > 1)
-                  predict_luma(pred_type, image.blocks[(bx-1)+(by-1)*blocks_width], image.blocks[(bx-1)+by*blocks_width], image.blocks[bx+(by-1)*blocks_width], luma_dc_pred);
-               decode_dc_luma(pred_type == 0 ? 0 : 1, luma_dc, luma_dc_fit);
-
-               for (unsigned i = 0; i < BLOCK_SIZE2; i++)
-                  block.luma_res[i] = luma_dc_res[i] = max(min(luma_dc_pred[i] + luma_dc_fit[i], 1.0), 0.0);
-            }
-
-            // Calculate difference range
-            double max_luma = -1e6, min_luma = 0; // Min Luma starts with zero to force it to at least zero
-            for (unsigned y = 0; y < BLOCK_SIZE; y++)
-               for (unsigned x = 0; x < BLOCK_SIZE; x++)
-               {
-                  unsigned index = x+y*BLOCK_SIZE;
-                  double luma_diff = block.luma[index] - luma_dc_res[index];
-                  if (max_luma < luma_diff) max_luma = luma_diff;
-                  if (min_luma > luma_diff) min_luma = luma_diff;
-               }
-
-            // Lookup threshold per quality level
-            unsigned diff_threshold = 2;
-            unsigned bit_alloc_offset = 2;
-            unsigned lowest_bit_alloc = 1;
-            unsigned most_bit_alloc = 4;
-
-            // Calculate luma difference scale and offset
-            block.luma_diff_offset = min(max((int)ceil(-min_luma * 255.0), 0), 255);
-            double luma_offset = block.luma_diff_offset / 255.0;
-            block.luma_diff_scale = min(max((int)ceil((max_luma + luma_offset) * 127.0), 0), 255);
-            double luma_scale = block.luma_diff_scale / 127.0;
-
-            if (block.luma_diff_scale < diff_threshold)
-            {
-               block.luma_diff_scale = 0;
-               luma_scale = 0.0;
-               block.luma_bits_used += 8;
-            }
-            else 
-               block.luma_bits_used += 16;
-
-            unsigned luma_scale_bits = 1;
-            while ((1 << luma_scale_bits) < block.luma_diff_scale) luma_scale_bits++;
-
-            const double inv_luma_scale = 127.0 / block.luma_diff_scale;
-
-            uint16_t factor = 0;
-            if (block.luma_diff_scale > 0)
-            {
-               // Determine luma difference bit allocation
-               unsigned bit_allocation = max(luma_scale_bits-bit_alloc_offset, 1U);//min(max((unsigned)luma_scale_bits, 2U), 6U);
-               //if (roughness > 15) bit_allocation--;
-               if (roughness > 20) bit_allocation--;
-               if (bit_allocation == 1 && roughness < 5 && luma_scale_bits >= 3) bit_allocation = 2;
-               bit_allocation = min(max((unsigned)bit_allocation, lowest_bit_alloc), most_bit_alloc);
-
-               block.bit_allocation = bit_allocation;
-               factor = (1<<block.bit_allocation)-1;
-               block.luma_bits_used += 4;
-
-               // Calculate luma difference
-               double above_error[BLOCK_SIZE];
-               for (unsigned i = 0; i < BLOCK_SIZE; i++) above_error[i] = 0;
-
-               for (unsigned y = 0; y < BLOCK_SIZE; y++)
-               {
-                  double error = 0.0;
-                  for (unsigned x = 0; x < BLOCK_SIZE; x++)
+                  for (int k = 0; k < 2; k++)
                   {
-                     unsigned index = x+y*BLOCK_SIZE;
-                     double luma_diff = (block.luma[index] - luma_dc_res[index] + luma_offset) * inv_luma_scale + (error + above_error[x]) * 0.5;
-                     int luma_q = (int)round(luma_diff * factor);
-
-                     block.luma_diff[index] = luma_q;
-
-                     // Decode again for reference as well as for error calculation
-                     double decode_luma_diff = luma_q / (double)factor;
-                     error = luma_diff - decode_luma_diff;
-                     above_error[x] = error;
-                     block.luma_res[index] = luma_dc_res[index] + decode_luma_diff * luma_scale - luma_offset;
+                     chroma_center_a[k] = total_a[k] / total_c[k];
+                     chroma_center_b[k] = total_b[k] / total_c[k];
                   }
                }
             }
-            else
-               for (unsigned i = 0; i < BLOCK_SIZE2; i++)
-                  block.luma_res[i] = luma_dc_res[i];
 
-            // Compress luma diffs
-            /*uint8_t l = block.luma_comp[0] = block.luma_diff[0];
-            for (unsigned i = 1; i < BLOCK_SIZE2; i++)
+            for (unsigned j = 0; j < BLOCK_SIZE2; j++)
             {
-               block.luma_comp[i] = l ^ block.luma_diff[i];
-               l = block.luma_diff[i];
-            }*/
+               double dist[2] = {0};
+               double chroma_a = block.chroma_a[j];
+               double chroma_b = block.chroma_b[j];
 
-            // Determine chroma prediction coefficients
+               for (int k = 0; k < 2; k++)
+                  dist[k] = sqr(chroma_center_a[k] - chroma_a) + sqr(chroma_center_b[k] - chroma_b);
+
+               if (dist[0] > dist[1])
+                  printf("1 ");
+               else
+                  printf("0 ");
+            }
+            printf("\n");
+            printf("(%f, %f) (%f, %f)\n", chroma_center_a[0], chroma_center_b[0], chroma_center_a[1], chroma_center_b[1]);
+         }
+
+         double part_diff = sqr(chroma_center_a[0] - chroma_center_a[1]) + sqr(chroma_center_b[0] - chroma_center_b[1]);
+
+         // Determine chroma prediction coefficients
+         double chroma_a_c0, chroma_a_c1, chroma_b_c0, chroma_b_c1;
+         if (part_diff > 0.01)
+         {
             bool chroma_a_same = true, chroma_b_same = true;
-            double chroma_a_c0, chroma_a_c1, chroma_b_c0, chroma_b_c1;
             double cov00, cov01, cov11, sumsq;
 
             double first_value = block.chroma_a[0];
             for (unsigned i = 1; i < BLOCK_SIZE2; i++)
-               if (abs(first_value - block.chroma_a[i]) > 0.001)
+               if (fabs(first_value - block.chroma_a[i]) > 0.001)
                {
                   chroma_a_same = false;
                   break;
@@ -520,11 +762,13 @@ void encode_decode(unsigned width, unsigned height, uint8_t* data)
 
             first_value = block.chroma_b[0];
             for (unsigned i = 1; i < BLOCK_SIZE2; i++)
-               if (abs(first_value - block.chroma_b[i]) > 0.001)
+            {
+               if (fabs(first_value - block.chroma_b[i]) > 0.001)
                {
                   chroma_b_same = false;
                   break;
                }
+            }
 
             if (chroma_b_same)
             {
@@ -537,617 +781,830 @@ void encode_decode(unsigned width, unsigned height, uint8_t* data)
                   &chroma_b_c0, &chroma_b_c1, 
                   &cov00, &cov01, &cov11, &sumsq);
             }
-
-            block.chroma_a_c0 = toInt10(chroma_a_c0 * 0.125 + 0.5);
-            block.chroma_a_c1 = toInt10(chroma_a_c1 * 0.0625 + 0.5);
-            block.chroma_b_c0 = toInt10(chroma_b_c0 * 0.125 + 0.5);
-            block.chroma_b_c1 = toInt10(chroma_b_c1 * 0.0625 + 0.5);
-            block.chroma_bits_used += 2 * (10 * 2);
          }
-
-      /// Initial transformation and stats collection phase
-      unsigned stats_luma_1bit[256] = {0};
-      unsigned stats_luma_2bit[4*4*4*4] = {0};
-      unsigned stats_luma_3bit[8*8] = {0};
-      unsigned stats_luma_4bit[16*16] = {0};
-
-      for (unsigned by = 0; by < blocks_height; by++)
-         for (unsigned bx = 0; bx < blocks_width; bx++)
+         else
          {
-            block_t& block = image.blocks[bx+by*blocks_width];
-
-            if (block.luma_diff_scale > 0)
-            {
-               mtf_encode8(block.luma_diff, block.luma_comp, BLOCK_SIZE2);
-
-               if (block.bit_allocation == 1)
-               {
-                  for (unsigned i = 0; i < BLOCK_SIZE2; i += 8)
-                  {
-                     uint8_t index = (block.luma_comp[i] << 7) + (block.luma_comp[i+1] << 6) + (block.luma_comp[i+2] << 5) + (block.luma_comp[i+3] << 4);
-                     index += (block.luma_comp[i+4] << 3) + (block.luma_comp[i+5] << 2) + (block.luma_comp[i+6] << 1) + block.luma_comp[i+7];
-                     stats_luma_1bit[index]++;
-                  }
-               }
-               else if (block.bit_allocation == 2)
-               {
-                  for (unsigned i = 0; i < BLOCK_SIZE2; i += 4)
-                     stats_luma_2bit[(block.luma_comp[i] << 6) + (block.luma_comp[i+1] << 4) + (block.luma_comp[i+2] << 2) + block.luma_comp[i+3]]++;
-               }
-               else if (block.bit_allocation == 3)
-               {
-                  for (unsigned i = 0; i < BLOCK_SIZE2; i += 2)
-                     stats_luma_3bit[(block.luma_comp[i] << 3) + block.luma_comp[i+1]]++;
-               }
-               else if (block.bit_allocation == 4)
-               {
-                  for (unsigned i = 0; i < BLOCK_SIZE2; i += 2)
-                     stats_luma_4bit[(block.luma_comp[i] << 4) + block.luma_comp[i+1]]++;
-               }
-            }
+            chroma_a_c0 = 0.5;
+            chroma_a_c1 = 0.0;
+            chroma_b_c0 = 0.5;
+            chroma_b_c1 = 0.0;
          }
 
-      /// Huffman tree construction
-      {
-         unsigned total = 0;
-         for (unsigned i = 0; i < 256; i++) total += stats_luma_1bit[i];
-         if (total > 0)
-         {
-            printf("1-bit stats:\n");
-            //for (unsigned i = 0; i < 256; i++) printf("%2i: %i\n", i, stats_luma_1bit[i]);
-            //printf("\n");
-
-            image.luma_1bit_huffman = build_huffman_tree(stats_luma_1bit, 256);
-
-            unsigned total_bits = 0;
-            for (unsigned i = 0; i < 256; i++)
-            {
-               uint32_t code = 0;
-               uint8_t length = get_huffman_code(image.luma_1bit_huffman, i, &code);
-               //printf("%2i: ", i);
-               //for (int j = length - 1; j >= 0; j--) printf("%i", (code >> j) & 1);
-               //printf("\n");
-               total_bits += length * stats_luma_1bit[i];
-            }
-            //printf("\n");
-
-            double bits_per_symbol = (double)total_bits / total;
-            printf("bits per symbol: %f\n", bits_per_symbol/8.0);
-            printf("compression: %f%%\n\n", bits_per_symbol/0.08);
-         }
+         block.chroma_a_c0[0] = toInt(chroma_a_c0 * 0.25 + 0.5);
+         block.chroma_a_c1[0] = toInt(chroma_a_c1 * 0.25 + 0.5);
+         block.chroma_b_c0[0] = toInt(chroma_b_c0 * 0.25 + 0.5);
+         block.chroma_b_c1[0] = toInt(chroma_b_c1 * 0.25 + 0.5);
       }
 
-      {
-         unsigned total = 0;
-         for (unsigned i = 0; i < 4*4*4*4; i++) total += stats_luma_2bit[i];
-         if (total > 0)
-         {
-            printf("2-bit stats:\n");
-            //for (unsigned i = 0; i < 4*4; i++) printf("%2i: %i\n", i, stats_luma_2bit[i]);
-            //printf("\n");
+   /// Initial transformation and stats collection phase
+   unsigned long stats_luma_mode[64] = {0};
+   unsigned long stats_luma_1bit[256] = {0};
+   unsigned long stats_luma_2bit[256] = {0};
+   unsigned long stats_luma_3bit[64] = {0};
+   unsigned long stats_luma_4bit[256] = {0};
+   unsigned long stats_luma_5bit[32] = {0};
+   unsigned long stats_luma_6bit[64] = {0};
+   unsigned long stats_luma_mode_total = 0;
+   unsigned long stats_luma_1bit_total = 0;
+   unsigned long stats_luma_2bit_total = 0;
+   unsigned long stats_luma_3bit_total = 0;
+   unsigned long stats_luma_4bit_total = 0;
+   unsigned long stats_luma_5bit_total = 0;
+   unsigned long stats_luma_6bit_total = 0;
 
-            image.luma_2bit_huffman = build_huffman_tree(stats_luma_2bit, 4*4*4*4);
+   stats_luma_mode[63]++; // Hack
 
-            unsigned total_bits = 0;
-            for (unsigned i = 0; i < 4*4*4*4; i++)
-            {
-               uint32_t code = 0;
-               uint8_t length = get_huffman_code(image.luma_2bit_huffman, i, &code);
-               //printf("%2i: ", i);
-               //for (int j = length - 1; j >= 0; j--) printf("%i", (code >> j) & 1);
-               //printf("\n");
-               total_bits += length * stats_luma_2bit[i];
-            }
-            //printf("\n");
+   uint8_t* luma_modes = new uint8_t[image.blocks_size/2];
+   {
+      for (unsigned i = 0; i < image.blocks_size; i += 2)
+         luma_modes[i>>1] = (image.blocks[i].luma_pred_mode << 3) + image.blocks[i+1].luma_pred_mode;
 
-            double bits_per_symbol = (double)total_bits / total;
-            printf("bits per symbol: %f\n", bits_per_symbol/4.0);
-            printf("compression: %f%%\n\n", bits_per_symbol/0.08);
-         }
-      }
-
-      {
-         unsigned total = 0;
-         for (unsigned i = 0; i < 8*8; i++) total += stats_luma_3bit[i];
-
-         if (total > 0)
-         {
-            printf("3-bit stats:\n");
-            //for (unsigned i = 0; i < 8*8; i++) printf("%2i: %i\n", i, stats_luma_3bit[i]);
-            //printf("\n");
-
-            image.luma_3bit_huffman = build_huffman_tree(stats_luma_3bit, 8*8);
-
-            unsigned total_bits = 0;
-            for (unsigned i = 0; i < 8*8; i++)
-            {
-               uint32_t code = 0;
-               uint8_t length = get_huffman_code(image.luma_3bit_huffman, i, &code);
-               //printf("%2i: ", i);
-               //for (int j = length - 1; j >= 0; j--) printf("%i", (code >> j) & 1);
-               //printf("\n");
-               total_bits += length * stats_luma_3bit[i];
-            }
-            //printf("\n");
-
-            double bits_per_symbol = (double)total_bits / total;
-            printf("bits per symbol: %f\n", bits_per_symbol/2.0);
-            printf("compression: %f%%\n\n", bits_per_symbol/0.06);
-         }
-      }
-
-      {
-         unsigned total = 0;
-         for (unsigned i = 0; i < 16*16; i++) total += stats_luma_4bit[i];
-
-         if (total > 0)
-         {
-            printf("4-bit stats:\n");
-            //for (unsigned i = 0; i < 16*16; i++) printf("%2i: %i\n", i, stats_luma_4bit[i]);
-            //printf("\n");
-
-            image.luma_4bit_huffman = build_huffman_tree(stats_luma_4bit, 16*16);
-
-            unsigned total_bits = 0;
-            for (unsigned i = 0; i < 16*16; i++)
-            {
-               uint32_t code = 0;
-               uint8_t length = get_huffman_code(image.luma_4bit_huffman, i, &code);
-               //printf("%2i: ", i);
-               //for (int j = length - 1; j >= 0; j--) printf("%i", (code >> j) & 1);
-               //printf("\n");
-               total_bits += length * stats_luma_4bit[i];
-            }
-            //printf("\n");
-
-            double bits_per_symbol = (double)total_bits / total;
-            printf("bits per symbol: %f\n", bits_per_symbol/2.0);
-            printf("compression: %f%%\n\n", bits_per_symbol/0.08);
-         }
-      }
-
-      /// Block compression and writing
-      for (unsigned by = 0; by < blocks_height; by++)
-         for (unsigned bx = 0; bx < blocks_width; bx++)
-         {
-            block_t& block = image.blocks[bx+by*blocks_width];
-
-            if (block.luma_diff_scale > 0)
-            {
-               /*
-               printf("Off: %.3f - Scale: %.3f - Max Diff: %i - Min Luma: %.3f - Max Luma: %.3f\n", luma_offset, luma_scale, factor, min_luma, max_luma);
-               for (unsigned y = 0; y < BLOCK_SIZE; y++)
-               {
-                  for (unsigned x = 0; x < BLOCK_SIZE; x++)
-                     printf("%3i ", block.luma_diff[x+y*BLOCK_SIZE]);
-                  printf("\n");
-               }
-               printf("\n");
-               */
-
-               uint8_t mtf_encoded[BLOCK_SIZE2];
-               uint8_t temp_encoded[BLOCK_SIZE2*2];
-
-               for (unsigned i = 0; i < BLOCK_SIZE2; i++) mtf_encoded[i] = block.luma_comp[i];
-               mtf_encode8(block.luma_diff, mtf_encoded, BLOCK_SIZE2);
-
-               bit_array_writer_t temp_luma_writer(temp_encoded, BLOCK_SIZE2*2);
-
-               bit_array_writer_t luma_writer(block.luma_bits, BLOCK_SIZE2*2);
-
-               if (block.bit_allocation == 1)
-               {
-                  unsigned orig_size = BLOCK_SIZE2;
-                  unsigned huffman_size = 0;
-                  unsigned runlength_size = runlength_bit_encode(mtf_encoded, BLOCK_SIZE2, temp_encoded, BLOCK_SIZE2*2, 4);
-
-                  for (unsigned i = 0; i < BLOCK_SIZE2; i += 8)
-                  {
-                     uint8_t symbol = (mtf_encoded[i] << 7) + (mtf_encoded[i+1] << 6) + (mtf_encoded[i+2] << 5) + (mtf_encoded[i+3] << 4);
-                     symbol += (mtf_encoded[i+4] << 3) + (mtf_encoded[i+5] << 2) + (mtf_encoded[i+6] << 1) + mtf_encoded[i+7];
-                     write_huffman_symbol(image.luma_1bit_huffman, temp_luma_writer, symbol);
-                  }
-                  temp_luma_writer.pad_to_byte();
-                  huffman_size = temp_luma_writer.get_size();
-
-                  if (runlength_size < huffman_size)
-                  {
-                     luma_writer.write_bit(1);
-                     runlength_bit_encode(mtf_encoded, BLOCK_SIZE2, luma_writer, 4);
-                  }
-                  else
-                  {
-                     luma_writer.write_bit(0);
-                     for (unsigned i = 0; i < BLOCK_SIZE2; i += 8)
-                     {
-                        uint8_t symbol = (mtf_encoded[i] << 7) + (mtf_encoded[i+1] << 6) + (mtf_encoded[i+2] << 5) + (mtf_encoded[i+3] << 4);
-                        symbol += (mtf_encoded[i+4] << 3) + (mtf_encoded[i+5] << 2) + (mtf_encoded[i+6] << 1) + mtf_encoded[i+7];
-                        write_huffman_symbol(image.luma_1bit_huffman, luma_writer, symbol);
-                     }
-                  }
-               }
-               else if (block.bit_allocation == 2)
-               {
-                  for (unsigned i = 0; i < BLOCK_SIZE2; i += 4)
-                  {
-                     uint8_t symbol = (mtf_encoded[i] << 6) + (mtf_encoded[i+1] << 4) + (mtf_encoded[i+2] << 2) + mtf_encoded[i+3];
-                     write_huffman_symbol(image.luma_2bit_huffman, luma_writer, symbol);
-                  }
-               }
-               else if (block.bit_allocation == 3)
-               {
-                  for (unsigned i = 0; i < BLOCK_SIZE2; i += 2)
-                  {
-                     uint8_t symbol = (mtf_encoded[i] << 3) + mtf_encoded[i+1];
-                     write_huffman_symbol(image.luma_3bit_huffman, luma_writer, symbol);
-                  }
-               }
-               else if (block.bit_allocation == 4)
-               {
-                  for (unsigned i = 0; i < BLOCK_SIZE2; i += 2)
-                  {
-                     uint8_t symbol = (mtf_encoded[i] << 4) + mtf_encoded[i+1];
-                     write_huffman_symbol(image.luma_4bit_huffman, luma_writer, symbol);
-                  }
-               }
-               else
-               {
-                  for (unsigned i = 0; i < BLOCK_SIZE2; i++)
-                     luma_writer.write_bits8(mtf_encoded[i], block.bit_allocation);
-               }
-               luma_writer.pad_to_byte();
-
-               block.luma_bits_used += luma_writer.get_size() * 8;
-
-               if (bx == 16 && by == 9)
-               {
-                  for (unsigned y = 0; y < BLOCK_SIZE; y++)
-                  {
-                     for (unsigned x = 0; x < BLOCK_SIZE; x++)
-                        printf("%3i ", mtf_encoded[x+y*BLOCK_SIZE]);
-                     printf("\n");
-                  }
-                  printf("\n");
-
-                  printf("Original bytes  : %i\n", block.bit_allocation*BLOCK_SIZE2/8);
-                  printf("Compressed bytes: %i\n", luma_writer.get_size());
-               }
-            }
-
-            luma_bits_used += block.luma_bits_used;
-            chroma_bits_used += block.chroma_bits_used;
-         }
-
-      gsl_multifit_linear_free(fitting_workspace3);
+      for (unsigned i = 0; i < image.blocks_size/2; i++)
+         stats_luma_mode[luma_modes[i]]++;
    }
 
-   //////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
-   // DECODE //
-   ////////////
-   {
+   for (unsigned by = 0; by < image.blocks_height; by++)
+      for (unsigned bx = 0; bx < image.blocks_width; bx++)
+      {
+         block_t& block = image.blocks[bx+by*image.blocks_width];
 
-      for (unsigned by = 0; by < blocks_height; by++)
-         for (unsigned bx = 0; bx < blocks_width; bx++)
+         if (block.luma_diff_scale > 0)
          {
-            block_t& block = image.blocks[bx+by*blocks_width];
+            block.luma_compress_mode = 0;
 
-            // Decode luma dc
-            int pred_mode = block.luma_pred_mode;
+            // if (block.bit_allocation == 4)//(bx == 16 && by == 9)
+            // {
+            //    printf("%i %i\n", bx, by);
+            //    for (unsigned y = 0; y < BLOCK_SIZE; y++)
+            //    {
+            //       for (unsigned x = 0; x < BLOCK_SIZE; x++)
+            //          printf("%3i ", block.luma_diff[x+y*BLOCK_SIZE]);
+            //       printf("\n");
+            //    }
+            //    printf("\n");
+            // }
 
-            double luma_dc[5];
-            luma_dc[0] = (fromInt(block.luma_dc[0]) - 0.5) * 2.0;
-            for (int i = 1; i < 3; i++)
-               luma_dc[i] = (fromInt(block.luma_dc[i]) - 0.5) / BLOCK_SIZE;
-
-            double luma_dc_pred[BLOCK_SIZE2] = {0.0};
-            double luma_dc_fit[BLOCK_SIZE2] = {0.0};
-            double luma_dc_res[BLOCK_SIZE2] = {0.0};
-
-            for (unsigned y = 0; y < BLOCK_SIZE; y++)
-               for (unsigned x = 0; x < BLOCK_SIZE; x++)
-                  luma_dc_pred[x+y*BLOCK_SIZE] = 0.0;
-
-            if (pred_mode > 1)
-               predict_luma(pred_mode, image.blocks[(bx-1)+(by-1)*blocks_width], image.blocks[(bx-1)+by*blocks_width], image.blocks[bx+(by-1)*blocks_width], luma_dc_pred);
-
-            decode_dc_luma(pred_mode == 0 ? 0 : 1, luma_dc, luma_dc_fit);
-
-            for (unsigned i = 0; i < BLOCK_SIZE2; i++)
-               luma_dc_res[i] = max(min(luma_dc_pred[i] + luma_dc_fit[i], 1.0), 0.0);
-
-            // Decode luma difference
-            if (block.luma_diff_scale > 0)
+            if (block.bit_allocation == 1)
             {
-               double luma_offset = block.luma_diff_offset / 255.0;
-               double luma_scale = block.luma_diff_scale / 127.0;
-               uint16_t factor = (1<<block.bit_allocation)-1;
-
-               /*
-               for (unsigned y = 0; y < BLOCK_SIZE; y+=2)
-                  for (unsigned x = 0; x < BLOCK_SIZE; x+=2)
-                  {
-                     unsigned index = x+y*BLOCK_SIZE;
-                     double v = luma_qs[index];
-                     double t = v;
-                     bool a1 = abs(luma_qs[index+1]-v) < 1.1;
-                     bool a2 = abs(luma_qs[index+BLOCK_SIZE]-v) < 1.1;
-                     bool a3 = abs(luma_qs[index+1+BLOCK_SIZE]-v) < 1.1;
-                     t += a1 ? luma_qs[index+1] : v;
-                     t += a2 ? luma_qs[index+BLOCK_SIZE] : v;
-                     t += a3 ? luma_qs[index+1+BLOCK_SIZE] : v;
-                     t *= 0.25;
-                     luma_qs[index] = t;
-                     if (a1) luma_qs[index+1] = t;
-                     if (a2) luma_qs[index+BLOCK_SIZE] = t;
-                     if (a3) luma_qs[index+1+BLOCK_SIZE] = t;
+               for (int y = 0; y < BLOCK_SIZE; y++)
+                  for (int x = 0; x < BLOCK_SIZE; x++) {
+                     int i = x + y * BLOCK_SIZE;
+                     block.luma_comp[i] = block.luma_diff[i] ^ ((x & 1) != (y & 1));
                   }
-               */
-
-               bit_array_reader_t luma_reader(block.luma_bits, BLOCK_SIZE2*2);
-
-               if (block.bit_allocation == 1)
-               {
-                  uint8_t b = luma_reader.read_bit();
-
-                  if (b == 1)
-                     runlength_bit_decode(luma_reader, block.luma_comp, BLOCK_SIZE2, 4);
-                  else
-                  {
-                     for (int i = 0; i < BLOCK_SIZE2; i += 8)
-                     {
-                        uint8_t symbol = read_huffman_symbol(image.luma_1bit_huffman, luma_reader);
-                        block.luma_comp[i  ] = (symbol >> 7) & 1;
-                        block.luma_comp[i+1] = (symbol >> 6) & 1;
-                        block.luma_comp[i+2] = (symbol >> 5) & 1;
-                        block.luma_comp[i+3] = (symbol >> 4) & 1;
-                        block.luma_comp[i+4] = (symbol >> 3) & 1;
-                        block.luma_comp[i+5] = (symbol >> 2) & 1;
-                        block.luma_comp[i+6] = (symbol >> 1) & 1;
-                        block.luma_comp[i+7] = symbol & 1;
-                     }
-                  }
-               }
-               else if (block.bit_allocation == 2)
-               {
-                  for (int i = 0; i < BLOCK_SIZE2; i += 4)
-                  {
-                     uint8_t symbol = read_huffman_symbol(image.luma_2bit_huffman, luma_reader);
-                     block.luma_comp[i] = (symbol >> 6) & 3;
-                     block.luma_comp[i+1] = (symbol >> 4) & 3;
-                     block.luma_comp[i+2] = (symbol >> 2) & 3;
-                     block.luma_comp[i+3] = symbol & 3;
-                  }
-               }
-               else if (block.bit_allocation == 3)
-               {
-                  for (int i = 0; i < BLOCK_SIZE2; i += 2)
-                  {
-                     uint8_t symbol = read_huffman_symbol(image.luma_3bit_huffman, luma_reader);
-                     block.luma_comp[i] = (symbol >> 3) & 7;
-                     block.luma_comp[i+1] = symbol & 7;
-                  }
-               }
-               else if (block.bit_allocation == 4)
-               {
-                  for (int i = 0; i < BLOCK_SIZE2; i += 2)
-                  {
-                     uint8_t symbol = read_huffman_symbol(image.luma_4bit_huffman, luma_reader);
-                     block.luma_comp[i] = (symbol >> 4) & 15;
-                     block.luma_comp[i+1] = symbol & 15;
-                  }
-               }
-               else
-               {
-                  for (int i = 0; i < BLOCK_SIZE2; i++)
-                     block.luma_comp[i] = luma_reader.read_bits8(block.bit_allocation);
-               }
-
-               mtf_decode8(block.luma_comp, block.luma_diff, BLOCK_SIZE2);
-
-               for (unsigned y = 0; y < BLOCK_SIZE; y++)
-                  for (unsigned x = 0; x < BLOCK_SIZE; x++)
-                  {
-                     unsigned index = x+y*BLOCK_SIZE;
-
-                     double luma_q = block.luma_diff[index];
-                     double luma_diff = (luma_q / factor) * luma_scale - luma_offset;
-                     //double luma = luma_dc_res[index];
-                     double luma = luma_dc_res[index] + luma_diff;
-
-                     block.luma[index] = luma;// + (random(x, y, bx+by*8) * 0.5 - 0.5) / factor * luma_scale;
-                     block.luma_res[index] = luma;
-                     //block.luma[index] = (block.luma[index] - luma) * 2.0 + 0.5;
-                  } 
             }
             else
             {
-               for (unsigned y = 0; y < BLOCK_SIZE; y++)
-                  for (unsigned x = 0; x < BLOCK_SIZE; x++)
-                  {
-                     unsigned index = x+y*BLOCK_SIZE;
-
-                     double luma = luma_dc_res[index];
-
-                     block.luma[index] = luma;
-                     block.luma_res[index] = luma;
-                     //block.luma[index] = (block.luma[index] - luma_dc_res[index]) * 2.0 + 0.5;
-                  }
-
-               // deblocking
-               if (bx > 0)
-                  for (unsigned y = 0; y < BLOCK_SIZE; y++)
-                  {
-                     unsigned index = y*BLOCK_SIZE;
-                     unsigned left_index = bx-1+by*blocks_width;
-                     block.luma[index] = block.luma[index] * 0.5 + image.blocks[left_index].luma_res[index+BLOCK_SIZE-1] * 0.5;
-                     block.luma[index+1] = block.luma[index+1] * 0.67 + image.blocks[left_index].luma_res[index+BLOCK_SIZE-1] * 0.33;
-                  }
-
-               if (by > 0)
-                  for (unsigned x = 0; x < BLOCK_SIZE; x++)
-                  {
-                     unsigned up_index = bx+(by-1)*blocks_width;
-                     block.luma[x] = block.luma[x] * 0.5 + image.blocks[up_index].luma_res[x+(BLOCK_SIZE-1)*BLOCK_SIZE] * 0.5;
-                     block.luma[x+BLOCK_SIZE] = block.luma[x+BLOCK_SIZE] * 0.67 + image.blocks[up_index].luma_res[x+(BLOCK_SIZE-1)*BLOCK_SIZE] * 0.33;
-                  }
-
-               // add a bit of noise
-               for (unsigned i = 0; i < BLOCK_SIZE2; i++)
-                  block.luma[i] += (random(i, bx+by*blocks_width) - 0.5) / 63.0;
+               mtf_encode8(block.luma_diff, block.luma_comp, BLOCK_SIZE2);
             }
 
-            // Predict chroma
-            double chroma_a_c0 = fromInt10(block.chroma_a_c0) * 8.0 - 4.0;
-            double chroma_a_c1 = fromInt10(block.chroma_a_c1) * 16.0 - 8.0;
-            double chroma_b_c0 = fromInt10(block.chroma_b_c0) * 8.0 - 4.0;
-            double chroma_b_c1 = fromInt10(block.chroma_b_c1) * 16.0 - 8.0;
+            // if (block.bit_allocation == 4)//(bx == 16 && by == 9)
+            // {
+            //    for (unsigned y = 0; y < BLOCK_SIZE; y++)
+            //    {
+            //       for (unsigned x = 0; x < BLOCK_SIZE; x++)
+            //          printf("%3i ", block.luma_comp[x+y*BLOCK_SIZE]);
+            //       printf("\n");
+            //    }
+            //    printf("\n");
+            // }
 
-            for (unsigned i = 0; i < BLOCK_SIZE2; i++)
+            if (block.bit_allocation == 1)
             {
-               block.chroma_a[i] = 0.0;
-               block.chroma_b[i] = 0.0;
+               for (unsigned i = 0; i < BLOCK_SIZE2; i += 8)
+               {
+                  unsigned symbol = 0;
+                  for (unsigned j = 0; j < 8; j++)
+                     symbol = (symbol << 1) + (block.luma_comp[i+j] & 1);
+                  stats_luma_1bit[symbol]++;
+               }
+            }
+            else if (block.bit_allocation == 2)
+            {
+               for (unsigned i = 0; i < BLOCK_SIZE2; i += 4)
+               {
+                  unsigned symbol = 0;
+                  for (unsigned j = 0; j < 4; j++)
+                     symbol = (symbol << 2) + (block.luma_comp[i+j] & 3);
+                  stats_luma_2bit[symbol]++;
+               }
+            }
+            else if (block.bit_allocation == 3)
+            {
+               for (unsigned i = 0; i < BLOCK_SIZE2; i += 2)
+               {
+                  unsigned symbol = 0;
+                  for (unsigned j = 0; j < 2; j++)
+                     symbol = (symbol << 3) + (block.luma_comp[i+j] & 7);
+                  stats_luma_3bit[symbol]++;
+               }
+            }
+            else if (block.bit_allocation == 4)
+            {
+               for (unsigned i = 0; i < BLOCK_SIZE2; i += 2)
+               {
+                  unsigned symbol = 0;
+                  for (unsigned j = 0; j < 2; j++)
+                     symbol = (symbol << 4) + (block.luma_comp[i+j] & 15);
+                  stats_luma_4bit[symbol]++;
+               }
+            }
+            else if (block.bit_allocation == 5)
+            {
+               for (unsigned i = 0; i < BLOCK_SIZE2; i++)
+                  stats_luma_5bit[block.luma_comp[i] & 31]++;
+            }
+            else if (block.bit_allocation == 6)
+            {
+               for (unsigned i = 0; i < BLOCK_SIZE2; i++)
+                  stats_luma_6bit[block.luma_comp[i] & 63]++;
+            }
+         }
+      }
+
+   /// Huffman tree construction
+   {
+      for (unsigned i = 0; i < 64; i++) stats_luma_mode_total += stats_luma_mode[i];
+      if (stats_luma_mode_total > 0)
+         image.luma_mode_coder = build_canonical_huffman(stats_luma_mode, 64);
+
+      for (unsigned i = 0; i < 256; i++) stats_luma_1bit_total += stats_luma_1bit[i];
+      if (stats_luma_1bit_total > 0)
+         image.luma_1bit_coder = build_canonical_huffman(stats_luma_1bit, 256);
+
+      for (unsigned i = 0; i < 256; i++) stats_luma_2bit_total += stats_luma_2bit[i];
+      if (stats_luma_2bit_total > 0)
+         image.luma_2bit_coder = build_canonical_huffman(stats_luma_2bit, 256);
+
+      for (unsigned i = 0; i < 64; i++) stats_luma_3bit_total += stats_luma_3bit[i];
+      if (stats_luma_3bit_total > 0)
+         image.luma_3bit_coder = build_canonical_huffman(stats_luma_3bit, 64);
+
+      for (unsigned i = 0; i < 16; i++) stats_luma_4bit_total += stats_luma_4bit[i];
+      if (stats_luma_4bit_total > 0)
+         image.luma_4bit_coder = build_canonical_huffman(stats_luma_4bit, 256);
+
+      for (unsigned i = 0; i < 32; i++) stats_luma_5bit_total += stats_luma_5bit[i];
+      if (stats_luma_5bit_total > 0)
+         image.luma_5bit_coder = build_canonical_huffman(stats_luma_5bit, 32);
+
+      for (unsigned i = 0; i < 64; i++) stats_luma_6bit_total += stats_luma_6bit[i];
+      if (stats_luma_6bit_total > 0)
+         image.luma_6bit_coder = build_canonical_huffman(stats_luma_6bit, 64);
+   }
+   
+   unsigned long stats_luma_bit_length[6] = {0, 0, 0, 0, 0, 0};
+   unsigned long stats_luma_bit_blocks[6] = {0, 0, 0, 0, 0, 0};
+
+   /// Block compression and writing
+   bit_file_writer_t writer(output_filename);
+   
+   {
+      // Write magic bytes
+      writer.write_byte('P');
+      writer.write_byte('A');
+      writer.write_byte('C');
+      writer.write_byte('%');
+
+      // Write image size
+      write_variable_length_number(image.width, writer);
+      write_variable_length_number(image.height, writer);
+
+      printf(" block count: %i\n", image.blocks_size);
+      printf(" basic header info: %i\n", writer.get_bytes_written());
+
+      // Write block modes   
+      write_canonical_huffman(image.luma_mode_coder, writer);
+      image.luma_mode_coder->encode(luma_modes, image.blocks_size/2, writer);
+      delete [] luma_modes;
+
+      // Write block mode values
+      for (size_t i = 0; i < image.blocks_size; i++)
+      {
+         block_t& block = image.blocks[i];
+
+         uint8_t components = 0;
+         if (block.luma_pred_mode == 0)
+            components = 1;
+         else if (block.luma_pred_mode == 1)
+            components = 3;
+         else if (block.luma_pred_mode == 7)
+            components = 4;
+         else
+            components = 1;
+         for (size_t j = 0; j < components; j++)
+            writer.write_byte(block.luma_dc[j]);
+      }
+
+      // Write block bit allocation values
+      {
+         uint8_t* block_bit_allocs = new uint8_t[image.blocks_size];
+         uint8_t* block_bit_allocs_encoded = new uint8_t[image.blocks_size];
+
+         for (size_t i = 0; i < image.blocks_size; i++) 
+            block_bit_allocs[i] = image.blocks[i].bit_allocation;
+
+         mtf_encode8(block_bit_allocs, block_bit_allocs_encoded, image.blocks_size);
+
+         for (size_t i = 0; i < image.blocks_size; i++) 
+            write_rice2_code(block_bit_allocs_encoded[i], writer);
+
+         delete [] block_bit_allocs;
+         delete [] block_bit_allocs_encoded;
+      }
+
+      printf(" + mode data size: %i\n", writer.get_bytes_written());
+
+      // Write block luma dc and chroma predictors
+      for (size_t i = 0; i < image.blocks_size; i++)
+      {
+         block_t& block = image.blocks[i];
+         if (block.bit_allocation > 0)
+         {
+            writer.write_byte(block.luma_diff_offset);
+            writer.write_byte(block.luma_diff_scale);
+         }
+      }
+
+      printf(" + dc pred data size: %i\n", writer.get_bytes_written());
+
+      uint8_t* buffer1 = new uint8_t[image.blocks_size];
+      uint8_t* buffer2 = new uint8_t[image.blocks_size];
+
+      for (size_t i = 0; i < image.blocks_size; i++) buffer1[i] = image.blocks[i].chroma_a_c0[0];
+      delta_encode8(buffer1, buffer2, image.blocks_size);
+
+      writer.write_byte(buffer2[0]);
+      for (size_t i = 1; i < image.blocks_size; i++) write_elias_gamma_code(buffer2[i], writer);
+
+      for (size_t i = 0; i < image.blocks_size; i++) buffer1[i] = image.blocks[i].chroma_a_c1[0];
+      delta_encode8(buffer1, buffer2, image.blocks_size);
+
+      writer.write_byte(buffer2[0]);
+      for (size_t i = 1; i < image.blocks_size; i++) write_elias_gamma_code(buffer2[i], writer);
+
+      for (size_t i = 0; i < image.blocks_size; i++) buffer1[i] = image.blocks[i].chroma_b_c0[0];
+      delta_encode8(buffer1, buffer2, image.blocks_size);
+
+      writer.write_byte(buffer2[0]);
+      for (size_t i = 1; i < image.blocks_size; i++) write_elias_gamma_code(buffer2[i], writer);
+
+      for (size_t i = 0; i < image.blocks_size; i++) buffer1[i] = image.blocks[i].chroma_b_c1[0];
+      delta_encode8(buffer1, buffer2, image.blocks_size);
+
+      writer.write_byte(buffer2[0]);
+      for (size_t i = 1; i < image.blocks_size; i++) write_elias_gamma_code(buffer2[i], writer);
+
+      writer.pad_to_byte(0);
+
+      delete [] buffer1;
+      delete [] buffer2;
+
+      printf(" + chroma pred data size: %i\n", writer.get_bytes_written());
+
+      // Write huffman trees
+      uint8_t used_trees = 0;
+      used_trees |= (stats_luma_1bit_total > 0 ? 1 : 0) << 0;
+      used_trees |= (stats_luma_2bit_total > 0 ? 1 : 0) << 1;
+      used_trees |= (stats_luma_3bit_total > 0 ? 1 : 0) << 2;
+      used_trees |= (stats_luma_4bit_total > 0 ? 1 : 0) << 3;
+      used_trees |= (stats_luma_5bit_total > 0 ? 1 : 0) << 4;
+      used_trees |= (stats_luma_6bit_total > 0 ? 1 : 0) << 5;
+      writer.write_byte(used_trees);
+
+      if (stats_luma_1bit_total > 0) write_canonical_huffman(image.luma_1bit_coder, writer);
+      if (stats_luma_2bit_total > 0) write_canonical_huffman(image.luma_2bit_coder, writer);
+      if (stats_luma_3bit_total > 0) write_canonical_huffman(image.luma_3bit_coder, writer);
+      if (stats_luma_4bit_total > 0) write_canonical_huffman(image.luma_4bit_coder, writer);
+      if (stats_luma_5bit_total > 0) write_canonical_huffman(image.luma_5bit_coder, writer);
+      if (stats_luma_6bit_total > 0) write_canonical_huffman(image.luma_6bit_coder, writer);
+      writer.pad_to_byte(0);
+
+      printf(" + residual huffman: %i\n", writer.get_bytes_written());
+   }
+
+   unsigned block_bit_counts[6] = {0, 0, 0, 0, 0, 0};
+
+   for (unsigned by = 0; by < image.blocks_height; by++)
+      for (unsigned bx = 0; bx < image.blocks_width; bx++)
+      {
+         block_t& block = image.blocks[bx+by*image.blocks_width];
+
+         if (block.luma_diff_scale > 0 && block.bit_allocation <= 6)
+            block_bit_counts[block.bit_allocation-1]++;
+      }
+
+   for (unsigned b = 0; b < 6; b++)
+   {
+      if (block_bit_counts[b] == 0) continue;
+      unsigned bit_allocation = b + 1;
+      unsigned total_length = block_bit_counts[b] * BLOCK_SIZE2;
+      unsigned index = 0;
+      uint8_t* luma_all = new uint8_t[total_length];
+
+      for (unsigned by = 0; by < image.blocks_height; by++)
+         for (unsigned bx = 0; bx < image.blocks_width; bx++)
+         {
+            block_t& block = image.blocks[bx+by*image.blocks_width];
+
+            if (block.luma_diff_scale > 0 && block.bit_allocation == bit_allocation)
+               for (unsigned i = 0; i < BLOCK_SIZE2; i++) 
+                  luma_all[index++] = block.luma_comp[i];
+         } 
+
+      unsigned start_bytes = writer.get_bytes_written();
+
+      if (bit_allocation == 1)
+      {
+         uint8_t* temp = new uint8_t[total_length/8];
+         compress_1bit_to_8bit(luma_all, total_length, temp); 
+         image.luma_1bit_coder->encode(temp, total_length/8, writer);
+         delete [] temp;
+      }
+      else if (bit_allocation == 2)
+      {
+         uint8_t* temp = new uint8_t[total_length/4];
+         compress_2bit_to_8bit(luma_all, total_length, temp); 
+         image.luma_2bit_coder->encode(temp, total_length/4, writer);
+         delete [] temp;
+      }
+      else if (bit_allocation == 3)
+      {
+         uint8_t* temp = new uint8_t[total_length/2];
+         compress_3bit_to_6bit(luma_all, total_length, temp); 
+         image.luma_3bit_coder->encode(temp, total_length/2, writer);
+         delete [] temp;
+      }
+      else if (bit_allocation == 4)
+      {
+         uint8_t* temp = new uint8_t[total_length/2];
+         compress_4bit_to_8bit(luma_all, total_length, temp); 
+         image.luma_4bit_coder->encode(temp, total_length/2, writer);
+         delete [] temp;
+      }
+      else if (bit_allocation == 5)
+         image.luma_5bit_coder->encode(luma_all, total_length, writer);
+      else if (bit_allocation == 6)
+         image.luma_6bit_coder->encode(luma_all, total_length, writer);
+
+      stats_luma_bit_length[b] = writer.get_bytes_written() - start_bytes;
+      stats_luma_bit_blocks[b] = block_bit_counts[b];
+
+      delete [] luma_all;
+   }
+
+   writer.pad_to_byte();
+
+   for (int i = 0; i < 6; i++)
+      if (stats_luma_bit_blocks[i] > 0) 
+      {
+         double encoded_per_block = (double)stats_luma_bit_length[i] / stats_luma_bit_blocks[i];
+         double original_per_block = (BLOCK_SIZE2 * (i + 1) + 7) / 8;
+         printf("%i-bit block:\n", i+1);
+         printf(" - Encoded bytes per block:  %f\n", encoded_per_block);
+         printf(" - Original bytes per block: %f\n", original_per_block);
+         printf(" - Compression: %f%%\n", encoded_per_block * 100.0 / original_per_block);
+      }
+
+   int bytes_used = writer.get_bytes_written();
+   cout << "Bits per pixel:" << ((double)bytes_used*8/width/height) << " bpp" << endl;
+   cout << "Bytes used:" << bytes_used << " bytes" << endl;
+   cout << "Kilobytes used:" << (bytes_used/1000.0) << " kB" << endl;
+
+   gsl_multifit_linear_free(fitting_workspace3);
+   delete [] image.pixels;
+}
+
+//////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+// DECODE //
+////////////
+uint8_t* decode(string input_filename, unsigned& width, unsigned& height)
+{
+   cout << " ==== DECODING ==== " << endl;
+
+   image_t image;
+
+   unsigned blocks_width;
+   unsigned blocks_height;
+   unsigned blocks_size;
+
+   unsigned size;
+
+   bit_file_reader_t reader(input_filename);
+
+   if (!reader.is_open())
+   {
+      cout << "Could not open file" << endl;
+      return nullptr;
+   }
+
+   uint8_t magic[4];
+   magic[0] = reader.read_byte();
+   magic[1] = reader.read_byte();
+   magic[2] = reader.read_byte();
+   magic[3] = reader.read_byte();
+   assert(magic[0] == 'P' && magic[1] == 'A' && magic[2] == 'C' && magic[3] == '%');
+
+   // Read image size
+   image.width = read_variable_length_number(reader);
+   image.height = read_variable_length_number(reader);
+   printf("size: %ix%i\n", image.width, image.height);
+   
+   // Calculate block sizes
+   size = image.width * image.height;
+
+   blocks_width = (image.width + BLOCK_SIZE - 1) / BLOCK_SIZE;
+   blocks_height = (image.height + BLOCK_SIZE - 1) / BLOCK_SIZE;
+   blocks_size = blocks_width * blocks_height;
+   image.blocks = new block_t[blocks_size];
+
+   // Read in block modes
+   printf("read: %i\n", reader.get_bytes_read());
+   uint8_t* block_modes = new uint8_t[blocks_size/2];
+   image.luma_mode_coder = read_canonical_huffman(reader);
+   image.luma_mode_coder->decode(reader, block_modes, blocks_size/2);
+
+   for (size_t i = 0; i < blocks_size; i += 2)
+   {
+      image.blocks[i  ].luma_pred_mode = block_modes[i>>1] >> 3;
+      image.blocks[i+1].luma_pred_mode = block_modes[i>>1] & 7;
+   }
+   delete [] block_modes;
+
+   // Read in block values
+   for (size_t i = 0; i < blocks_size; i++)
+   {
+      block_t& block = image.blocks[i];
+
+      uint8_t components = 0;
+      if (block.luma_pred_mode == 0)
+         components = 1;
+      else if (block.luma_pred_mode == 1)
+         components = 3;
+      else if (block.luma_pred_mode == 7)
+         components = 4;
+      else
+         components = 1;
+      for (size_t j = 0; j < components; j++)
+         block.luma_dc[j] = reader.read_byte();
+   }
+
+   {
+      uint8_t* block_bit_allocs_encoded = new uint8_t[blocks_size];
+      uint8_t* block_bit_allocs = new uint8_t[blocks_size];
+
+      for (size_t i = 0; i < blocks_size; i++) 
+         block_bit_allocs_encoded[i] = read_rice2_code(reader);
+
+      mtf_decode8(block_bit_allocs_encoded, block_bit_allocs, blocks_size);
+
+      for (size_t i = 0; i < blocks_size; i++) 
+         image.blocks[i].bit_allocation = block_bit_allocs[i];
+
+      delete [] block_bit_allocs;
+      delete [] block_bit_allocs_encoded;
+   }
+
+   for (size_t i = 0; i < blocks_size; i++)
+   {
+      block_t& block = image.blocks[i];
+
+      if (block.bit_allocation > 0)
+      {
+         block.luma_diff_offset = reader.read_byte();
+         block.luma_diff_scale = reader.read_byte();
+      }
+   }
+
+   uint8_t* buffer1 = new uint8_t[blocks_size];
+   uint8_t* buffer2 = new uint8_t[blocks_size];
+
+   buffer1[0] = reader.read_byte();
+   for (unsigned i = 1; i < blocks_size; i++)
+      buffer1[i] = read_elias_gamma_code(reader);
+
+   delta_decode8(buffer1, buffer2, blocks_size);
+
+   for (unsigned i = 0; i < blocks_size; i++) image.blocks[i].chroma_a_c0[0] = buffer2[i];
+
+   buffer1[0] = reader.read_byte();
+   for (unsigned i = 1; i < blocks_size; i++)
+      buffer1[i] = read_elias_gamma_code(reader);
+
+   delta_decode8(buffer1, buffer2, blocks_size);
+
+   for (unsigned i = 0; i < blocks_size; i++) image.blocks[i].chroma_a_c1[0] = buffer2[i];
+
+   buffer1[0] = reader.read_byte();
+   for (unsigned i = 1; i < blocks_size; i++)
+      buffer1[i] = read_elias_gamma_code(reader);
+
+   delta_decode8(buffer1, buffer2, blocks_size);
+
+   for (unsigned i = 0; i < blocks_size; i++) image.blocks[i].chroma_b_c0[0] = buffer2[i];
+
+   buffer1[0] = reader.read_byte();
+   for (unsigned i = 1; i < blocks_size; i++)
+      buffer1[i] = read_elias_gamma_code(reader);
+
+   delta_decode8(buffer1, buffer2, blocks_size);
+
+   for (unsigned i = 0; i < blocks_size; i++) image.blocks[i].chroma_b_c1[0] = buffer2[i];
+
+   reader.skip_to_next_byte();
+
+   delete [] buffer1;
+   delete [] buffer2;
+
+   // Read in huffman trees
+   uint8_t used_trees = reader.read_byte();
+   printf("used: %4x\n", used_trees);
+   printf("read: %i\n", reader.get_bytes_read());
+   if (((used_trees >> 0) & 1) == 1) image.luma_1bit_coder = read_canonical_huffman(reader);
+   if (((used_trees >> 1) & 1) == 1) image.luma_2bit_coder = read_canonical_huffman(reader);
+   if (((used_trees >> 2) & 1) == 1) image.luma_3bit_coder = read_canonical_huffman(reader);
+   if (((used_trees >> 3) & 1) == 1) image.luma_4bit_coder = read_canonical_huffman(reader);
+   if (((used_trees >> 4) & 1) == 1) image.luma_5bit_coder = read_canonical_huffman(reader);
+   if (((used_trees >> 5) & 1) == 1) image.luma_6bit_coder = read_canonical_huffman(reader);
+   reader.skip_to_next_byte();
+
+   // Decode residual
+   unsigned block_bit_counts[6] = {0, 0, 0, 0, 0, 0};
+
+   for (unsigned by = 0; by < blocks_height; by++)
+      for (unsigned bx = 0; bx < blocks_width; bx++)
+      {
+         block_t& block = image.blocks[bx+by*blocks_width];
+
+         if (block.luma_diff_scale > 0 && block.bit_allocation <= 6)
+            block_bit_counts[block.bit_allocation-1]++;
+      }
+
+   for (unsigned b = 0; b < 6; b++)
+   {
+      if (block_bit_counts[b] == 0) continue;
+      unsigned bit_allocation = b + 1;
+      unsigned total_length = block_bit_counts[b] * BLOCK_SIZE2;
+      unsigned index = 0;
+      uint8_t* luma_all = new uint8_t[total_length];
+
+      if (bit_allocation == 1)
+      {
+         uint8_t* temp = new uint8_t[total_length/8];
+         image.luma_1bit_coder->decode(reader, temp, total_length/8);
+         expand_8bit_to_1bit(temp, total_length/8, luma_all);
+         delete [] temp;
+      }
+      else if (bit_allocation == 2)
+      {
+         uint8_t* temp = new uint8_t[total_length/4];
+         image.luma_2bit_coder->decode(reader, temp, total_length/4);
+         expand_8bit_to_2bit(temp, total_length/4, luma_all);
+         delete [] temp;
+      }
+      else if (bit_allocation == 3)
+      {
+         uint8_t* temp = new uint8_t[total_length/2];
+         image.luma_3bit_coder->decode(reader, temp, total_length/2);
+         expand_6bit_to_3bit(temp, total_length/2, luma_all);
+         delete [] temp;
+      }
+      else if (bit_allocation == 4)
+      {
+         uint8_t* temp = new uint8_t[total_length/2];
+         image.luma_4bit_coder->decode(reader, temp, total_length/2);
+         expand_8bit_to_4bit(temp, total_length/2, luma_all);
+         delete [] temp;
+      }
+      else if (bit_allocation == 5)
+         image.luma_5bit_coder->decode(reader, luma_all, total_length);
+      else if (bit_allocation == 6)
+         image.luma_6bit_coder->decode(reader, luma_all, total_length);
+
+      for (unsigned by = 0; by < blocks_height; by++)
+         for (unsigned bx = 0; bx < blocks_width; bx++)
+         {
+            block_t& block = image.blocks[bx+by*blocks_width];
+
+            // Decode luma difference
+            if (block.luma_diff_scale > 0 && bit_allocation == block.bit_allocation)
+               for (unsigned i = 0; i < BLOCK_SIZE2; i++) 
+                  block.luma_comp[i] = luma_all[index++];
+         }
+   }
+
+   // Calculate final values
+   for (unsigned by = 0; by < blocks_height; by++)
+      for (unsigned bx = 0; bx < blocks_width; bx++)
+      {     
+         block_t& block = image.blocks[bx+by*blocks_width];
+
+         int mode = block.luma_pred_mode;
+
+         double luma_dc[16];
+         if (mode == 0)
+         {
+            luma_dc[0] = fromInt(block.luma_dc[0]);
+         }
+         else if (mode == 7)
+         {
+            for (int i = 0; i < 4; i++)
+               luma_dc[i] = fromInt(block.luma_dc[i]);
+         }
+         else
+         {
+            for (int i = 0; i < 3; i++)
+               luma_dc[i] = (fromInt(block.luma_dc[i]) - 0.5) * 2.0;
+         }
+
+         double luma_dc_pred[BLOCK_SIZE2] = {0.0};
+         double luma_dc_fit[BLOCK_SIZE2] = {0.0};
+         double luma_dc_res[BLOCK_SIZE2] = {0.0};
+
+         for (unsigned y = 0; y < BLOCK_SIZE; y++)
+            for (unsigned x = 0; x < BLOCK_SIZE; x++)
+               luma_dc_pred[x+y*BLOCK_SIZE] = 0.0;
+
+         if (mode > 1 && mode < 7)
+            predict_luma(mode, image.blocks[(bx-1)+(by-1)*blocks_width], image.blocks[(bx-1)+by*blocks_width], image.blocks[bx+(by-1)*blocks_width], luma_dc_pred);
+
+         decode_dc_luma(mode, luma_dc, luma_dc_fit);
+
+         for (unsigned i = 0; i < BLOCK_SIZE2; i++)
+            luma_dc_res[i] = max(min(luma_dc_pred[i] + luma_dc_fit[i], 1.0), 0.0);
+
+         if (block.luma_diff_scale > 0)
+         {
+            double luma_offset = block.luma_diff_offset / 255.0;
+            double luma_scale = block.luma_diff_scale / 127.0;
+            uint16_t factor = (1<<block.bit_allocation)-1;
+
+            if (block.bit_allocation == 1) 
+            {
+               for (int y = 0; y < BLOCK_SIZE; y++)
+                  for (int x = 0; x < BLOCK_SIZE; x++) {
+                     int i = x + y * BLOCK_SIZE;
+                     block.luma_diff[i] = block.luma_comp[i] ^ ((x & 1) != (y & 1));
+                  }
+            }
+            else 
+            {
+               mtf_decode8(block.luma_comp, block.luma_diff, BLOCK_SIZE2);
             }
 
             for (unsigned y = 0; y < BLOCK_SIZE; y++)
                for (unsigned x = 0; x < BLOCK_SIZE; x++)
                {
                   unsigned index = x+y*BLOCK_SIZE;
-                  /*
-                  double L = 0.25*(block.luma[index]+block.luma[index+1]+block.luma[index+1+BLOCK_SIZE]+block.luma[index+BLOCK_SIZE]);
+                  double luma_q = block.luma_diff[index];
+                  double luma_diff = (luma_q / factor) * luma_scale - luma_offset;
+                  double luma = luma_diff + luma_dc_res[index];
+                  block.luma[index] = luma;
+                  block.luma_res[index] = luma;
+               }
+         }
+         else
+         {
+            for (unsigned y = 0; y < BLOCK_SIZE; y++)
+               for (unsigned x = 0; x < BLOCK_SIZE; x++)
+               {
+                  unsigned index = x+y*BLOCK_SIZE;
 
-                  block.chroma_a[index] = a;
-                  block.chroma_a[index+1] = a;
-                  block.chroma_a[index+1+BLOCK_SIZE] = a;
-                  block.chroma_a[index+BLOCK_SIZE] = a;
-                  block.chroma_b[index] = b;
-                  block.chroma_b[index+1] = b;
-                  block.chroma_b[index+1+BLOCK_SIZE] = b;
-                  block.chroma_b[index+BLOCK_SIZE] = b;
-                  */
+                  double luma = luma_dc_res[index];
 
-                  double L = block.luma[index];
-                  double a = max(min(L * chroma_a_c1 + chroma_a_c0, 1.0), -1.0);
-                  double b = max(min(L * chroma_b_c1 + chroma_b_c0, 1.0), -1.0);
-                  block.chroma_a[index] = a;
-                  block.chroma_b[index] = b;
+                  block.luma[index] = luma;
+                  block.luma_res[index] = luma;
                }
          }
 
-         for (unsigned my = 0; my < blocks_height; my++)
-            for (unsigned mx = 0; mx < blocks_width; mx++)
+         // Predict chroma
+         double chroma_a_c0 = fromInt(block.chroma_a_c0[0]) * 4.0 - 2.0;
+         double chroma_a_c1 = fromInt(block.chroma_a_c1[0]) * 4.0 - 2.0;
+         double chroma_b_c0 = fromInt(block.chroma_b_c0[0]) * 4.0 - 2.0;
+         double chroma_b_c1 = fromInt(block.chroma_b_c1[0]) * 4.0 - 2.0;
+
+         for (unsigned i = 0; i < BLOCK_SIZE2; i++)
+         {
+            block.chroma_a[i] = 0.5;
+            block.chroma_b[i] = 0.5;
+         }
+
+         for (unsigned y = 0; y < BLOCK_SIZE; y++)
+            for (unsigned x = 0; x < BLOCK_SIZE; x++)
             {
-               block_t& block = image.blocks[mx+my*blocks_width];
-               for (unsigned by = 0; by < BLOCK_SIZE; by++)
-                  for (unsigned bx = 0; bx < BLOCK_SIZE; bx++)
-                  {
-                     unsigned x = mx*BLOCK_SIZE + bx, y = my*BLOCK_SIZE + by;
-                     unsigned index = x+y*width;
-                     unsigned block_index = bx+by*BLOCK_SIZE;
-                     
-                     pixels[index*4+0] = block.luma[block_index];
-                     pixels[index*4+1] = block.chroma_a[block_index];
-                     pixels[index*4+2] = block.chroma_b[block_index];
-                  }
+               unsigned index = x+y*BLOCK_SIZE;
+               /*
+               double L = 0.25*(block.luma[index]+block.luma[index+1]+block.luma[index+1+BLOCK_SIZE]+block.luma[index+BLOCK_SIZE]);
+
+               block.chroma_a[index] = a;
+               block.chroma_a[index+1] = a;
+               block.chroma_a[index+1+BLOCK_SIZE] = a;
+               block.chroma_a[index+BLOCK_SIZE] = a;
+               block.chroma_b[index] = b;
+               block.chroma_b[index+1] = b;
+               block.chroma_b[index+1+BLOCK_SIZE] = b;
+               block.chroma_b[index+BLOCK_SIZE] = b;
+               */
+
+               double L = block.luma[index];
+               double a = max(min(L * chroma_a_c1 + chroma_a_c0, 1.0), 0.0);
+               double b = max(min(L * chroma_b_c1 + chroma_b_c0, 1.0), 0.0);
+               block.chroma_a[index] = a;
+               block.chroma_b[index] = b;
             }
-   }
+      }
 
+   image.pixels = new double[size*4];
 
+   for (unsigned my = 0; my < blocks_height; my++)
+      for (unsigned mx = 0; mx < blocks_width; mx++)
+      {
+         block_t& block = image.blocks[mx+my*blocks_width];
+         for (unsigned by = 0; by < BLOCK_SIZE; by++)
+            for (unsigned bx = 0; bx < BLOCK_SIZE; bx++)
+            {
+               unsigned x = mx*BLOCK_SIZE + bx, y = my*BLOCK_SIZE + by;
+               unsigned index = x+y*image.width;
+               unsigned block_index = bx+by*BLOCK_SIZE;
 
-   double r_error = 0.0, g_error = 0.0, b_error = 0.0;
+               if (x >= image.width || y >= image.height) continue;
+               
+               image.pixels[index*4+0] = block.luma[block_index];
+               image.pixels[index*4+1] = block.chroma_a[block_index];
+               image.pixels[index*4+2] = block.chroma_b[block_index];
+            }
+      }
 
+   delete [] image.blocks;
+
+   uint8_t* data = new uint8_t[image.width*image.height*4];
    for (unsigned i = 0; i < size; i++)
    {
-      double L = pixels[i*4+0];
-      double a = pixels[i*4+1];
-      double b = pixels[i*4+2];
+      double y = image.pixels[i*4+0];
+      double cb = image.pixels[i*4+1];
+      double cr = image.pixels[i*4+2];
 
-      double yr = (L + 0.16) / 1.16;
-      double xr = a / 5.00 + yr;
-      double zr = yr - b / 2.00;
+      double r = y + (cr - 0.5) * 1.402;
+      double g = y - (cb - 0.5) * 0.34414 - (cr - 0.5) * 0.71414;
+      double b = y + (cb - 0.5) * 1.722;
 
-      double xr3 = xr*xr*xr, yr3 = yr*yr*yr, zr3 = zr*zr*zr;
-      xr = xr3 > 0.008856 ? xr3 : (xr - 16.0 / 116.0) / 7.87;
-      yr = yr3 > 0.008856 ? yr3 : (yr - 16.0 / 116.0) / 7.87;
-      zr = zr3 > 0.008856 ? zr3 : (zr - 16.0 / 116.0) / 7.87;
-
-      double x = xr * 0.95047;
-      double y = yr * 1.00000;
-      double z = zr * 1.08883;
-
-      {
-         double r = x *  3.2406 + y * -1.5372 + z * -0.4986;
-         double g = x * -0.9689 + y *  1.8758 + z *  0.0415;
-         double b = x *  0.0557 + y * -0.2040 + z *  1.0570;
-
-         // Convert to sRGB
-         r = (r > THRESHOLD2) ? FACTOR1 * pow(r, INV_GAMMA) - OFFSET : FACTOR2 * r;
-         g = (g > THRESHOLD2) ? FACTOR1 * pow(g, INV_GAMMA) - OFFSET : FACTOR2 * g;
-         b = (b > THRESHOLD2) ? FACTOR1 * pow(b, INV_GAMMA) - OFFSET : FACTOR2 * b;
-
-         uint8_t ir = toInt(r);
-         uint8_t ig = toInt(g);
-         uint8_t ib = toInt(b);
-
-         int er = data[i*4+0]-ir;
-         int eg = data[i*4+1]-ig;
-         int eb = data[i*4+2]-ib;
-         r_error += er*er;
-         g_error += eg*eg;
-         b_error += eb*eb;
-
-         data[i*4+0] = ir;
-         data[i*4+1] = ig;
-         data[i*4+2] = ib;
-         data[i*4+3] = 255;
-      }
+      data[i*4+0] = toInt(r);
+      data[i*4+1] = toInt(g);
+      data[i*4+2] = toInt(b);
+      data[i*4+3] = 255;
    }
 
-   int bits_used = luma_bits_used + chroma_bits_used;
-   r_error /= size;
-   b_error /= size;
-   g_error /= size;
-   cout << "Luma Bytes used:" << (luma_bits_used/8) << " B" << endl;
-   cout << "Chroma Bytes used:" << (chroma_bits_used/8) << " B" << endl;
-   cout << "Bytes used:" << (bits_used/8) << " B" << endl;
-   cout << "Luma Bits per pixel:" << ((double)luma_bits_used/width/height) << " bps" << endl;
-   cout << "Chroma Bits per pixel:" << ((double)chroma_bits_used/width/height) << " bps" << endl;
-   cout << "Bits per pixel:" << ((double)bits_used/width/height) << " bps" << endl;
-   cout << "Kilobytes used:" << (bits_used/8/1024) << " KB" << endl;
-   cout << "R error: " << r_error << endl;
-   cout << "G error: " << g_error << endl;
-   cout << "B error: " << b_error << endl;
-   cout << "W error: " << (r_error * 0.2126 + g_error * 0.7152 + b_error * 0.0722) << endl;
+   delete [] image.pixels;
 
-   delete [] pixels;
-   delete [] image.blocks;
+   width = image.width;
+   height = image.height;
+   return data;
 }
 
-int main()
+int main(int argc, char* args[])
 {
-   string   name = "test/coast";
+   unsigned quality = (argc >= 3 ? atoi(args[2]) : 4);
+   string   name = "test/" + (argc >= 2 ? string(args[1]) : "park_joy");
    string   filename = name + ".png";
    string   result_filename = name + "_out.png";
 
-   unsigned width, height;
-   uint8_t* image;
-
-
-   unsigned error;
-   error = lodepng_decode32_file(&image, &width, &height, filename.c_str());
-   if (error)
+   //try
    {
-      cout << "Could not load file: " << filename << endl;
-      return 1;
+      {
+         unsigned width, height;
+         uint8_t* image;
+         unsigned error;
+
+         error = lodepng_decode32_file(&image, &width, &height, filename.c_str());
+         if (error)
+         {
+            cout << "Could not load file: " << filename << endl;
+            return 1;
+         }
+
+         encode("test/a.pac", image, width, height, quality);
+      }
+
+      {
+         unsigned width, height;
+         uint8_t* image;
+         unsigned error;
+
+         image = decode("test/a.pac", width, height);
+
+         error = lodepng_encode32_file(result_filename.c_str(), image, width, height);
+         if (error)
+         {
+            cout << "Could not save file: " << result_filename << endl;
+            return 2;
+         }
+
+         cout << "Output: " << result_filename << endl;
+      }
    }
-
-   encode_decode(width, height, image);
-
-   error = lodepng_encode32_file(result_filename.c_str(), image, width, height);
-   if (error)
+   /*catch (...)
    {
-      cout << "Could not save file: " << result_filename << endl;
-      return 2;
-   }
+      cout << "ERROR!!" << endl;
+   }*/
 
    return 0;
 }

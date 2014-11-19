@@ -3,14 +3,17 @@
 
 #include <cassert>
 
-class bit_array_writer_t
+#include "bit.h"
+
+class bit_array_writer_t : public bit_writer_t
 {
 public:
-   bit_array_writer_t(uint8_t* bytes, unsigned max_size) : buffer(0), bit_size(0), bytes(bytes), max_size(max_size)
+   bit_array_writer_t(uint8_t* bytes, unsigned max_size, unsigned offset = 0) : buffer(0), bit_size(0), bytes(bytes), max_size(max_size)
    {
+      if (offset > 0) bytes = &bytes[offset];
    }
 
-   unsigned get_size()
+   unsigned get_bytes_written()
    {
       return bytes_index;
    }
@@ -23,6 +26,23 @@ public:
    uint8_t* get_data()
    {
       return bytes;
+   }
+
+   void write_bytes(uint8_t* bytes, unsigned length)
+   {
+      for (unsigned i = 0; i < length; i++)
+         write_byte(bytes[i]);
+   }
+
+   void write_byte(uint8_t byte)
+   {
+      if (bit_size == 0)
+      {
+         assert(bytes_index < max_size);
+         bytes[bytes_index++] = byte;
+      }
+      else
+         write_bits8(byte, 8);
    }
 
    void write_bits8(uint8_t bits, uint8_t bit_count)
@@ -55,8 +75,8 @@ public:
       bit_size++;
       if (bit_size == 8)
       {
+         assert(bytes_index < max_size);
          bytes[bytes_index++] = buffer;
-         assert(bytes_index <= max_size);
          bit_size = 0;
          buffer = 0;
       }
@@ -66,8 +86,8 @@ public:
    {
       if (bit_size == 0) return;
       if (pad_bit == 1) buffer |= (1 << (7-bit_size+1)) - 1;
+      assert(bytes_index < max_size);
       bytes[bytes_index++] = buffer;
-      assert(bytes_index <= max_size);
       bit_size = 0;
       buffer = 0;
    }
@@ -81,11 +101,23 @@ public:
    unsigned max_size = 0;
 };
 
-class bit_array_reader_t
+class bit_array_reader_t : public bit_reader_t
 {
 public:
-   bit_array_reader_t(uint8_t* bytes, unsigned size) : bytes(bytes), size(size)
+   bit_array_reader_t(uint8_t* bytes, unsigned size, unsigned offset = 0) : bytes(bytes), size(size)
    {
+      if (offset > 0) bytes = &bytes[offset];
+   }
+
+   uint8_t read_byte()
+   {
+      if (bit_size == 0)
+      {
+         if (bytes_index >= size) throw end_of_file_exception_t();
+         buffer = bytes[bytes_index++];
+         return buffer;
+      }
+      return read_bits8(8);
    }
 
    uint8_t read_bits8(uint8_t bit_count)
@@ -116,14 +148,19 @@ public:
    {
       if (bit_size == 0)
       {
+         if (bytes_index >= size) throw end_of_file_exception_t();
          buffer = bytes[bytes_index++];
-         assert(bytes_index <= size);
          bit_size = 8;
       }
       uint8_t b = (buffer >> 7) & 1;
       buffer <<= 1;
       bit_size--;
       return b;
+   }
+
+   void skip_to_next_byte()
+   {
+      bit_size = 0;
    }
 
 private:
