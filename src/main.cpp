@@ -496,10 +496,10 @@ void generate_bit_allocation_data(image_t& image, unsigned bx, unsigned by, resi
             double diff = block.luma[index] - residual[index];
 
             // Positioned dithering
-            double dither[16] = {1, 9, 3, 11, 13, 5, 15, 7, 4, 12, 2, 10, 16, 8, 14, 6};
+            double dither[64] = {1, 49, 13, 61, 4, 52, 16, 64, 33, 17, 45, 29, 36, 20, 48, 32, 9, 57, 5, 53, 12, 60, 8, 56, 41, 25, 37, 21, 44, 28, 40, 24, 3, 51, 15, 63, 2, 50, 14, 62, 35, 19, 47, 31, 34, 18, 46, 30, 11, 59, 7, 55, 10, 58, 6, 54, 43, 27, 39, 23, 42, 26, 38, 22};
 
             double luma_diff = (block.luma[index] - luma_base) * inv_luma_scale;
-            int luma_q = clamp((int)floor(luma_diff * factor + dither[(x&3)+(y&3)*4] / 17.0), 0, factor);
+            int luma_q = clamp((int)floor(luma_diff * factor + dither[(x&7)+(y&7)*8] / 65.0), 0, factor);
 
             block.luma_diff[index] = luma_q;
 
@@ -644,8 +644,6 @@ void encode(string output_filename, uint8_t* data, unsigned width, unsigned heig
             }
          }
 
-         printf("%i ", lowest_mode);
-
          mode_stats_t mode_stats;
          double* residual = generate_mode_data(image, bx, by, mode_stats, lowest_mode);
          residual_stats_t residual_stats;
@@ -653,96 +651,15 @@ void encode(string output_filename, uint8_t* data, unsigned width, unsigned heig
 
          block_t& block = image.blocks[bx+by*image.blocks_width];
 
-         // Determine chroma centers
-         double chroma_center_a[2] = {0.25, 0.75}, chroma_center_b[2] = {0.75, 0.25};
-         {
-            double total_a[2], total_b[2];
-            unsigned total_c[2];
-            bool chroma_center_reset = false;
-
-            printf("%i %i -- ", bx, by);
-            for (int i = 0; i < 100; i++)
-            {
-               total_a[0] = 0.0;
-               total_a[1] = 0.0;
-               total_b[0] = 0.0;
-               total_b[1] = 0.0;
-               total_c[0] = 0;
-               total_c[1] = 0;
-
-               for (unsigned j = 0; j < BLOCK_SIZE2; j++)
-               {
-                  double dist[2] = {0};
-                  double chroma_a = block.chroma_a[j];
-                  double chroma_b = block.chroma_b[j];
-
-                  for (int k = 0; k < 2; k++)
-                     dist[k] = sqr(chroma_center_a[k] - chroma_a) + sqr(chroma_center_b[k] - chroma_b);
-
-                  if (dist[0] > dist[1])
-                  {
-                     total_a[1] += chroma_a;
-                     total_b[1] += chroma_b;
-                     total_c[1]++;
-                  }
-                  else
-                  {
-                     total_a[0] += chroma_a;
-                     total_b[0] += chroma_b;
-                     total_c[0]++;
-                  }
-               }
-
-               if ((total_c[0] == 0 || total_c[1] == 0) && !chroma_center_reset)
-               {
-                  chroma_center_reset = true;
-
-                  chroma_center_a[0] = block.chroma_a[0];
-                  chroma_center_b[0] = block.chroma_b[0];
-
-                  chroma_center_a[1] = block.chroma_a[BLOCK_SIZE2-1];
-                  chroma_center_b[1] = block.chroma_b[BLOCK_SIZE2-1];
-               }
-               else
-               {
-                  for (int k = 0; k < 2; k++)
-                  {
-                     chroma_center_a[k] = total_a[k] / total_c[k];
-                     chroma_center_b[k] = total_b[k] / total_c[k];
-                  }
-               }
-            }
-
-            for (unsigned j = 0; j < BLOCK_SIZE2; j++)
-            {
-               double dist[2] = {0};
-               double chroma_a = block.chroma_a[j];
-               double chroma_b = block.chroma_b[j];
-
-               for (int k = 0; k < 2; k++)
-                  dist[k] = sqr(chroma_center_a[k] - chroma_a) + sqr(chroma_center_b[k] - chroma_b);
-
-               if (dist[0] > dist[1])
-                  printf("1 ");
-               else
-                  printf("0 ");
-            }
-            printf("\n");
-            printf("(%f, %f) (%f, %f)\n", chroma_center_a[0], chroma_center_b[0], chroma_center_a[1], chroma_center_b[1]);
-         }
-
-         double part_diff = sqr(chroma_center_a[0] - chroma_center_a[1]) + sqr(chroma_center_b[0] - chroma_center_b[1]);
-
          // Determine chroma prediction coefficients
          double chroma_a_c0, chroma_a_c1, chroma_b_c0, chroma_b_c1;
-         if (part_diff > 0.01)
          {
             bool chroma_a_same = true, chroma_b_same = true;
             double cov00, cov01, cov11, sumsq;
 
             double first_value = block.chroma_a[0];
             for (unsigned i = 1; i < BLOCK_SIZE2; i++)
-               if (fabs(first_value - block.chroma_a[i]) > 0.001)
+               if (fabs(first_value - block.chroma_a[i]) > 0.01)
                {
                   chroma_a_same = false;
                   break;
@@ -763,7 +680,7 @@ void encode(string output_filename, uint8_t* data, unsigned width, unsigned heig
             first_value = block.chroma_b[0];
             for (unsigned i = 1; i < BLOCK_SIZE2; i++)
             {
-               if (fabs(first_value - block.chroma_b[i]) > 0.001)
+               if (fabs(first_value - block.chroma_b[i]) > 0.01)
                {
                   chroma_b_same = false;
                   break;
@@ -782,18 +699,15 @@ void encode(string output_filename, uint8_t* data, unsigned width, unsigned heig
                   &cov00, &cov01, &cov11, &sumsq);
             }
          }
-         else
-         {
-            chroma_a_c0 = 0.5;
-            chroma_a_c1 = 0.0;
-            chroma_b_c0 = 0.5;
-            chroma_b_c1 = 0.0;
-         }
+
+         //printf("%6f %6f %6f %6f\n", chroma_a_c0, chroma_a_c1, chroma_b_c0, chroma_b_c1);
 
          block.chroma_a_c0[0] = toInt(chroma_a_c0 * 0.25 + 0.5);
-         block.chroma_a_c1[0] = toInt(chroma_a_c1 * 0.25 + 0.5);
+         block.chroma_a_c1[0] = toInt(chroma_a_c1 * 0.5 + 0.5);
          block.chroma_b_c0[0] = toInt(chroma_b_c0 * 0.25 + 0.5);
-         block.chroma_b_c1[0] = toInt(chroma_b_c1 * 0.25 + 0.5);
+         block.chroma_b_c1[0] = toInt(chroma_b_c1 * 0.5 + 0.5);
+
+         //printf("%3i %3i %3i %3i\n", block.chroma_a_c0[0], block.chroma_a_c1[0], block.chroma_b_c0[0], block.chroma_b_c1[0]);
       }
 
    /// Initial transformation and stats collection phase
@@ -1478,9 +1392,9 @@ uint8_t* decode(string input_filename, unsigned& width, unsigned& height)
 
          // Predict chroma
          double chroma_a_c0 = fromInt(block.chroma_a_c0[0]) * 4.0 - 2.0;
-         double chroma_a_c1 = fromInt(block.chroma_a_c1[0]) * 4.0 - 2.0;
+         double chroma_a_c1 = fromInt(block.chroma_a_c1[0]) * 2.0 - 1.0;
          double chroma_b_c0 = fromInt(block.chroma_b_c0[0]) * 4.0 - 2.0;
-         double chroma_b_c1 = fromInt(block.chroma_b_c1[0]) * 4.0 - 2.0;
+         double chroma_b_c1 = fromInt(block.chroma_b_c1[0]) * 2.0 - 1.0;
 
          for (unsigned i = 0; i < BLOCK_SIZE2; i++)
          {
@@ -1492,24 +1406,11 @@ uint8_t* decode(string input_filename, unsigned& width, unsigned& height)
             for (unsigned x = 0; x < BLOCK_SIZE; x++)
             {
                unsigned index = x+y*BLOCK_SIZE;
-               /*
-               double L = 0.25*(block.luma[index]+block.luma[index+1]+block.luma[index+1+BLOCK_SIZE]+block.luma[index+BLOCK_SIZE]);
-
-               block.chroma_a[index] = a;
-               block.chroma_a[index+1] = a;
-               block.chroma_a[index+1+BLOCK_SIZE] = a;
-               block.chroma_a[index+BLOCK_SIZE] = a;
-               block.chroma_b[index] = b;
-               block.chroma_b[index+1] = b;
-               block.chroma_b[index+1+BLOCK_SIZE] = b;
-               block.chroma_b[index+BLOCK_SIZE] = b;
-               */
-
                double L = block.luma[index];
                double a = max(min(L * chroma_a_c1 + chroma_a_c0, 1.0), 0.0);
                double b = max(min(L * chroma_b_c1 + chroma_b_c0, 1.0), 0.0);
-               block.chroma_a[index] = a;
-               block.chroma_b[index] = b;
+               //block.chroma_a[index] = a;
+               //block.chroma_b[index] = b;
             }
       }
 
@@ -1562,12 +1463,17 @@ uint8_t* decode(string input_filename, unsigned& width, unsigned& height)
 
 int main(int argc, char* args[])
 {
-   unsigned quality = (argc >= 3 ? atoi(args[2]) : 4);
-   string   name = "test/" + (argc >= 2 ? string(args[1]) : "park_joy");
+   if (argc < 2)
+   {
+      printf("Usage: %s <filename> [<quality>]", args[0]);
+      return 1;
+   }
+
+   unsigned quality = (unsigned)(argc >= 3 ? atoi(args[2]) : 4);
+   string   name = string(args[1]);
    string   filename = name + ".png";
    string   result_filename = name + "_out.png";
 
-   //try
    {
       {
          unsigned width, height;
@@ -1601,10 +1507,6 @@ int main(int argc, char* args[])
          cout << "Output: " << result_filename << endl;
       }
    }
-   /*catch (...)
-   {
-      cout << "ERROR!!" << endl;
-   }*/
 
    return 0;
 }
